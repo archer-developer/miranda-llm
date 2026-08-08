@@ -87,6 +87,13 @@ type ToolDef struct {
 type ChatRequest struct {
 	Messages []Message
 	Tools    []ToolDef
+	// Temperature overrides the provider's own default sampling
+	// temperature (0.0-1.0 for Gemini/OpenAI-compatible, 0.0-1.0 for
+	// Anthropic too). nil leaves the provider's own API default in place —
+	// set this explicitly when the caller's own task has a documented
+	// temperature requirement (e.g. low for anything feeding a downstream
+	// parser, higher for open-ended generation).
+	Temperature *float64
 }
 
 // StreamChunk is one increment of a streaming chat response. A stream ends
@@ -138,6 +145,18 @@ type StructuredRequest struct {
 	// characters Anthropic's tool-name field accepts (letters, digits,
 	// underscores, hyphens).
 	SchemaName string
+	// Temperature overrides the sampling temperature for this call. nil
+	// means "use defaultStructuredTemperature" (see each provider's
+	// Structured implementation) rather than the provider API's own
+	// default — unlike ChatRequest.Temperature, Structured calls default
+	// to low-temperature already, because run-to-run consistency matters
+	// far more for a result a parser will consume than the provider API's
+	// own default (often tuned for open-ended chat, i.e. much higher)
+	// would give: the same document, same prompt, same schema was
+	// observed to non-deterministically return fully-populated arrays on
+	// one call and entirely empty ones on the next at the API's default
+	// temperature. Set explicitly only to deliberately raise it back up.
+	Temperature *float64
 }
 
 // StructuredProvider is an optional capability a Provider may additionally

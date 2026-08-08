@@ -34,6 +34,24 @@ import (
 // Gemini API endpoint".
 var apiBaseURL string
 
+// defaultStructuredTemperature is used by Structured when
+// llm.StructuredRequest.Temperature is nil — see that field's doc comment
+// for why Structured doesn't just fall through to the API's own default
+// the way Chat does.
+var defaultStructuredTemperature = 0.1
+
+// toFloat32Ptr converts an optional float64 (the shared llm package's
+// temperature type, chosen for provider-agnosticism) to the *float32
+// genai.GenerateContentConfig.Temperature actually wants. Returns nil
+// unchanged so the SDK's own default applies.
+func toFloat32Ptr(v *float64) *float32 {
+	if v == nil {
+		return nil
+	}
+	f := float32(*v)
+	return &f
+}
+
 // ToolsConfig toggles Gemini's own native server-side tools sent on every
 // request from this provider — mirrors anthropic.ToolsConfig's
 // opt-in-only shape (all default to false).
@@ -149,6 +167,7 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.St
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction: system,
 		Tools:             p.buildTools(req.Tools),
+		Temperature:       toFloat32Ptr(req.Temperature),
 	}
 
 	out := make(chan llm.StreamChunk)
@@ -276,10 +295,15 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 // the same keyrotation.Run + isRetryable.
 func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (json.RawMessage, error) {
 	system, contents := toGeminiContents(req.Messages)
+	temperature := req.Temperature
+	if temperature == nil {
+		temperature = &defaultStructuredTemperature
+	}
 	cfg := &genai.GenerateContentConfig{
 		SystemInstruction:  system,
 		ResponseMIMEType:   "application/json",
 		ResponseJsonSchema: req.Schema,
+		Temperature:        toFloat32Ptr(temperature),
 	}
 
 	rotCfg := keyrotation.Config{

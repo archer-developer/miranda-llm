@@ -13,6 +13,7 @@ import (
 
 	"github.com/openai/openai-go/v2"
 	"github.com/openai/openai-go/v2/option"
+	"github.com/openai/openai-go/v2/packages/param"
 	"github.com/openai/openai-go/v2/packages/ssestream"
 	"github.com/openai/openai-go/v2/shared"
 
@@ -22,6 +23,20 @@ import (
 // defaultStructuredSchemaName is used by Structured when the caller's
 // StructuredRequest.SchemaName is empty.
 const defaultStructuredSchemaName = "structured_output"
+
+// defaultStructuredTemperature is used by Structured when
+// llm.StructuredRequest.Temperature is nil — see that field's doc comment.
+var defaultStructuredTemperature = 0.1
+
+// toParamOpt converts an optional float64 to the param.Opt[float64] the SDK
+// wants. Returns the zero value (omitted, per the `omitzero` tag) when v is
+// nil, so the API's own default applies.
+func toParamOpt(v *float64) param.Opt[float64] {
+	if v == nil {
+		return param.Opt[float64]{}
+	}
+	return openai.Float(*v)
+}
 
 // Provider is an llm.Provider (and llm.StructuredProvider) backed by any
 // OpenAI-compatible Chat Completions endpoint.
@@ -63,9 +78,10 @@ func (p *Provider) SetTracer(t llm.Tracer) {
 // index) into whole llm.ToolCall values before they're handed to the caller.
 func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
 	params := openai.ChatCompletionNewParams{
-		Model:    shared.ChatModel(p.model),
-		Messages: toOpenAIMessages(req.Messages),
-		Tools:    toOpenAITools(req.Tools),
+		Model:       shared.ChatModel(p.model),
+		Messages:    toOpenAIMessages(req.Messages),
+		Tools:       toOpenAITools(req.Tools),
+		Temperature: toParamOpt(req.Temperature),
 	}
 
 	stream := p.client.Chat.Completions.NewStreaming(ctx, params)
@@ -152,6 +168,10 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 		name = defaultStructuredSchemaName
 	}
 
+	temperature := req.Temperature
+	if temperature == nil {
+		temperature = &defaultStructuredTemperature
+	}
 	params := openai.ChatCompletionNewParams{
 		Model:    shared.ChatModel(p.model),
 		Messages: toOpenAIMessages(req.Messages),
@@ -163,6 +183,7 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 				},
 			},
 		},
+		Temperature: toParamOpt(temperature),
 	}
 
 	resp, err := p.client.Chat.Completions.New(ctx, params)

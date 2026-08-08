@@ -12,6 +12,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 
 	llm "github.com/archer-developer/miranda-llm"
@@ -29,6 +30,22 @@ const codeExecutionCaller = "code_execution_20260521"
 // defaultStructuredToolName is used by Structured when the caller's
 // StructuredRequest.SchemaName is empty.
 const defaultStructuredToolName = "structured_output"
+
+// defaultStructuredTemperature is used by Structured when
+// llm.StructuredRequest.Temperature is nil — see that field's doc comment.
+var defaultStructuredTemperature = 0.1
+
+// toParamOpt converts an optional float64 to the param.Opt[float64] the SDK
+// wants. Returns the zero value (omitted, per the `omitzero` tag on
+// MessageNewParams.Temperature) when v is nil, so the API's own default
+// applies — matches Chat's existing behavior for a nil
+// ChatRequest.Temperature.
+func toParamOpt(v *float64) param.Opt[float64] {
+	if v == nil {
+		return param.Opt[float64]{}
+	}
+	return anthropic.Float(*v)
+}
 
 // ToolsConfig toggles which of Claude's native server-side tools are sent
 // on every request from this provider. All default to false (opt-in) since
@@ -91,11 +108,12 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.St
 	system, messages := toAnthropicMessages(req.Messages)
 
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(p.model),
-		MaxTokens: p.maxTokens,
-		System:    system,
-		Messages:  messages,
-		Tools:     p.buildTools(req.Tools),
+		Model:       anthropic.Model(p.model),
+		MaxTokens:   p.maxTokens,
+		System:      system,
+		Messages:    messages,
+		Tools:       p.buildTools(req.Tools),
+		Temperature: toParamOpt(req.Temperature),
 	}
 
 	stream := p.client.Messages.NewStreaming(ctx, params)
@@ -175,13 +193,18 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 		},
 	}
 
+	temperature := req.Temperature
+	if temperature == nil {
+		temperature = &defaultStructuredTemperature
+	}
 	params := anthropic.MessageNewParams{
-		Model:      anthropic.Model(p.model),
-		MaxTokens:  p.maxTokens,
-		System:     system,
-		Messages:   messages,
-		Tools:      []anthropic.ToolUnionParam{tool},
-		ToolChoice: anthropic.ToolChoiceParamOfTool(toolName),
+		Model:       anthropic.Model(p.model),
+		MaxTokens:   p.maxTokens,
+		System:      system,
+		Messages:    messages,
+		Tools:       []anthropic.ToolUnionParam{tool},
+		ToolChoice:  anthropic.ToolChoiceParamOfTool(toolName),
+		Temperature: toParamOpt(temperature),
 	}
 
 	message, err := p.client.Messages.New(ctx, params)
