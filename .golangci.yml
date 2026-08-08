@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Closing a response body / stream / connection in a defer after the
+      # resource already did its job is a standard Go idiom; the close error
+      # (if any) carries nothing actionable at that point.
+      exclude-functions:
+        - (io.Closer).Close
