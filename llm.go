@@ -145,17 +145,24 @@ type StructuredRequest struct {
 	// characters Anthropic's tool-name field accepts (letters, digits,
 	// underscores, hyphens).
 	SchemaName string
-	// Temperature overrides the sampling temperature for this call. nil
-	// means "use defaultStructuredTemperature" (see each provider's
-	// Structured implementation) rather than the provider API's own
-	// default — unlike ChatRequest.Temperature, Structured calls default
-	// to low-temperature already, because run-to-run consistency matters
-	// far more for a result a parser will consume than the provider API's
-	// own default (often tuned for open-ended chat, i.e. much higher)
-	// would give: the same document, same prompt, same schema was
-	// observed to non-deterministically return fully-populated arrays on
-	// one call and entirely empty ones on the next at the API's default
-	// temperature. Set explicitly only to deliberately raise it back up.
+	// Temperature overrides the sampling temperature for this call. For
+	// Gemini and OpenAI-compatible providers, nil means "use
+	// defaultStructuredTemperature" (see each provider's Structured
+	// implementation) rather than the provider API's own default — unlike
+	// ChatRequest.Temperature, those providers' Structured calls default to
+	// low-temperature already, because run-to-run consistency matters far
+	// more for a result a parser will consume than the provider API's own
+	// default (often tuned for open-ended chat, i.e. much higher) would
+	// give: the same document, same prompt, same schema was observed to
+	// non-deterministically return fully-populated arrays on one call and
+	// entirely empty ones on the next at the API's default temperature.
+	// Set explicitly only to deliberately raise it back up.
+	//
+	// anthropic.Provider is the one exception: it never substitutes a
+	// default, nil or not — see its Structured doc comment for why (a
+	// current Claude model rejects the temperature parameter outright, not
+	// just out-of-range values, so no non-nil fallback is safe there
+	// anymore).
 	Temperature *float64
 }
 

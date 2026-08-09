@@ -31,10 +31,6 @@ const codeExecutionCaller = "code_execution_20260521"
 // StructuredRequest.SchemaName is empty.
 const defaultStructuredToolName = "structured_output"
 
-// defaultStructuredTemperature is used by Structured when
-// llm.StructuredRequest.Temperature is nil — see that field's doc comment.
-var defaultStructuredTemperature = 0.1
-
 // toParamOpt converts an optional float64 to the param.Opt[float64] the SDK
 // wants. Returns the zero value (omitted, per the `omitzero` tag on
 // MessageNewParams.Temperature) when v is nil, so the API's own default
@@ -172,6 +168,21 @@ func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, 
 // then reads the tool call's Input back as the result. One non-streaming
 // call (Messages.New), since a forced single tool call has no meaningful
 // streaming granularity to forward.
+//
+// Unlike Gemini/OpenAI-compatible Structured, this deliberately does NOT
+// substitute a default temperature when req.Temperature is nil (see
+// llm.StructuredRequest.Temperature's doc comment for why other providers
+// do) — toParamOpt passes it straight through, omitted when nil, same as
+// Chat. Observed in production (2026-08-09): a request that set
+// Temperature at all — including the "low, for determinism" default this
+// provider used to substitute — got a 400 from a current Claude model
+// ("`temperature` is deprecated for this model"), which made every
+// Structured call against that model fail outright, escalation included.
+// Since the parameter is being rejected wholesale rather than validated by
+// range, there's no safe non-nil value left to fall back to here; only
+// omitting it works. A caller that still wants deterministic structured
+// output from Claude has no lever for that via this field anymore — accept
+// whatever sampling behavior the model's own default is.
 func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (json.RawMessage, error) {
 	system, messages := toAnthropicMessages(req.Messages)
 
@@ -193,10 +204,6 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 		},
 	}
 
-	temperature := req.Temperature
-	if temperature == nil {
-		temperature = &defaultStructuredTemperature
-	}
 	params := anthropic.MessageNewParams{
 		Model:       anthropic.Model(p.model),
 		MaxTokens:   p.maxTokens,
@@ -204,7 +211,7 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 		Messages:    messages,
 		Tools:       []anthropic.ToolUnionParam{tool},
 		ToolChoice:  anthropic.ToolChoiceParamOfTool(toolName),
-		Temperature: toParamOpt(temperature),
+		Temperature: toParamOpt(req.Temperature),
 	}
 
 	message, err := p.client.Messages.New(ctx, params)
