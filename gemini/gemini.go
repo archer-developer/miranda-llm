@@ -318,6 +318,7 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 			if err != nil {
 				return err
 			}
+			p.logStructuredFinish(resp)
 			text := resp.Text()
 			result = json.RawMessage(text)
 			return nil
@@ -330,6 +331,32 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 	}
 	p.trace(ctx, contents, cfg, string(result), nil, nil)
 	return result, nil
+}
+
+// logStructuredFinish surfaces *why* a Structured response looked the way
+// it did — without this, a call that Gemini silently curtailed for safety
+// reasons (finishReason SAFETY/PROHIBITED_CONTENT/etc., or a prompt-level
+// block that leaves zero candidates) is completely indistinguishable from
+// the model genuinely finding nothing to extract: both return a
+// successful, valid-JSON response with every field empty, no error for
+// Structured's caller to see. Logged at Warn only for a finish that isn't
+// the unremarkable STOP (or empty, meaning finishReason wasn't populated),
+// so an ordinary call stays at Debug and doesn't drown out the cases worth
+// noticing.
+func (p *Provider) logStructuredFinish(resp *genai.GenerateContentResponse) {
+	if resp.PromptFeedback != nil && resp.PromptFeedback.BlockReason != "" {
+		p.logger.Warn("gemini: structured request blocked at prompt level", "provider", p.name, "blockReason", resp.PromptFeedback.BlockReason, "blockReasonMessage", resp.PromptFeedback.BlockReasonMessage)
+	}
+	if len(resp.Candidates) == 0 {
+		p.logger.Warn("gemini: structured request returned no candidates", "provider", p.name)
+		return
+	}
+	switch reason := resp.Candidates[0].FinishReason; reason {
+	case "", genai.FinishReasonStop:
+		p.logger.Debug("gemini: structured request finished", "provider", p.name, "finishReason", reason)
+	default:
+		p.logger.Warn("gemini: structured request finished abnormally", "provider", p.name, "finishReason", reason, "finishMessage", resp.Candidates[0].FinishMessage)
+	}
 }
 
 // toLLMToolCall converts a Gemini FunctionCall to llm.ToolCall,

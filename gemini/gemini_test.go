@@ -1,9 +1,11 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net/http"
 	"testing"
 
@@ -114,4 +116,48 @@ func TestNew_FailsFastWhenNoAPIKeyEnvResolves(t *testing.T) {
 	_, err := New(context.Background(), "test", "gemini-3.0", []string{"MIRANDA_LLM_TEST_UNSET_KEY"}, ToolsConfig{}, RotationConfig{}, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "none of the configured api_key_envs")
+}
+
+// TestLogStructuredFinish_AbnormalFinishReasonLogsWarn covers why
+// logStructuredFinish exists: a Structured call that Gemini silently
+// curtailed for safety reasons returns a normal, error-free response with
+// an empty result — identical, from the caller's side, to the model
+// genuinely finding nothing to extract. The only place that distinction is
+// visible at all is the response's own FinishReason, which Structured
+// previously never looked at.
+func TestLogStructuredFinish_AbnormalFinishReasonLogsWarn(t *testing.T) {
+	var buf bytes.Buffer
+	p := &Provider{name: "test-provider", logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+
+	p.logStructuredFinish(&genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{{FinishReason: genai.FinishReasonSafety}},
+	})
+
+	require.Contains(t, buf.String(), "level=WARN")
+	require.Contains(t, buf.String(), "finished abnormally")
+	require.Contains(t, buf.String(), "SAFETY")
+}
+
+func TestLogStructuredFinish_NormalStopFinishLogsDebugOnly(t *testing.T) {
+	var buf bytes.Buffer
+	p := &Provider{name: "test-provider", logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+
+	p.logStructuredFinish(&genai.GenerateContentResponse{
+		Candidates: []*genai.Candidate{{FinishReason: genai.FinishReasonStop}},
+	})
+
+	require.Contains(t, buf.String(), "level=DEBUG")
+	require.NotContains(t, buf.String(), "level=WARN")
+}
+
+func TestLogStructuredFinish_PromptLevelBlockLogsWarn(t *testing.T) {
+	var buf bytes.Buffer
+	p := &Provider{name: "test-provider", logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+
+	p.logStructuredFinish(&genai.GenerateContentResponse{
+		PromptFeedback: &genai.GenerateContentResponsePromptFeedback{BlockReason: genai.BlockedReasonSafety},
+	})
+
+	require.Contains(t, buf.String(), "level=WARN")
+	require.Contains(t, buf.String(), "blocked at prompt level")
 }
