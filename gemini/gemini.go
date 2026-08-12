@@ -239,6 +239,7 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 	start := time.Now()
 	var textBuf strings.Builder // accumulated only for tracing, not for forwarding
 	var toolCalls []llm.ToolCall
+	var usage *genai.GenerateContentResponseUsageMetadata
 	forwarded := false
 
 	for resp, streamErr := range client.Models.GenerateContentStream(ctx, p.model, contents, cfg) {
@@ -246,7 +247,7 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 			if forwarded {
 				p.logger.Error("gemini: request failed mid-stream after partial output, not retrying", "provider", p.name, "key_index", keyIndex, "error", streamErr)
 				wrapped := fmt.Errorf("gemini: %w", streamErr)
-				p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, wrapped)
+				p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, time.Since(start), usage, wrapped)
 				out <- llm.StreamChunk{Err: wrapped}
 				return errAttemptWritten
 			}
@@ -256,9 +257,12 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 			}
 			p.logger.Error("gemini: request failed", "provider", p.name, "key_index", keyIndex, "error", streamErr)
 			wrapped := fmt.Errorf("gemini: %w", streamErr)
-			p.trace(ctx, contents, cfg, "", nil, wrapped)
+			p.trace(ctx, contents, cfg, "", nil, time.Since(start), usage, wrapped)
 			out <- llm.StreamChunk{Err: wrapped}
 			return errAttemptWritten
+		}
+		if resp.UsageMetadata != nil {
+			usage = resp.UsageMetadata
 		}
 		for _, cand := range resp.Candidates {
 			if cand.Content == nil {
@@ -281,7 +285,7 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 	}
 
 	p.logger.Info("gemini: request succeeded", "provider", p.name, "key_index", keyIndex, "duration_ms", time.Since(start).Milliseconds())
-	p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, nil)
+	p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, time.Since(start), usage, nil)
 	out <- llm.StreamChunk{Done: true}
 	return nil
 }
@@ -311,7 +315,9 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
 
+	start := time.Now()
 	var result json.RawMessage
+	var usage *genai.GenerateContentResponseUsageMetadata
 	err := keyrotation.Run(ctx, p.logger, "gemini-structured", len(p.clients), rotCfg, isRetryable,
 		func(ctx context.Context, i int) error {
 			resp, err := p.clients[i].Models.GenerateContent(ctx, p.model, contents, cfg)
@@ -319,6 +325,7 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 				return err
 			}
 			p.logStructuredFinish(resp)
+			usage = resp.UsageMetadata
 			text := resp.Text()
 			result = json.RawMessage(text)
 			return nil
@@ -326,10 +333,10 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 	)
 	if err != nil {
 		wrapped := fmt.Errorf("gemini: structured: %w", err)
-		p.trace(ctx, contents, cfg, "", nil, wrapped)
+		p.trace(ctx, contents, cfg, "", nil, time.Since(start), usage, wrapped)
 		return nil, wrapped
 	}
-	p.trace(ctx, contents, cfg, string(result), nil, nil)
+	p.trace(ctx, contents, cfg, string(result), nil, time.Since(start), usage, nil)
 	return result, nil
 }
 
@@ -425,7 +432,18 @@ func isRetryable(err error) bool {
 // tool calls) to p.tracer, mirroring anthropic.Provider.trace's contract —
 // same pattern, just over Gemini's own types instead of Anthropic's. Used
 // by both Chat's attempt and Structured.
-func (p *Provider) trace(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig, text string, toolCalls []llm.ToolCall, err error) {
+//
+// duration/usage (added 2026-08-13) are diagnostic-only extras layered on
+// top of that same contract — how long this specific call took and, when
+// Gemini reported it, its prompt/candidates token counts — surfaced
+// because a real debugging session needed exactly this (medical.ask calls
+// silently taking many seconds under Gemini free-tier rate-limit retries)
+// and llm.log was otherwise the only place that could show it per-call.
+// Both are dropped on the error path along with the rest of respPayload —
+// llmtrace.Logger.Trace itself only ever writes the error message when err
+// is non-nil (see its own doc comment), so there's nowhere for them to
+// surface there regardless of what this method passes in.
+func (p *Provider) trace(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig, text string, toolCalls []llm.ToolCall, duration time.Duration, usage *genai.GenerateContentResponseUsageMetadata, err error) {
 	if p.tracer == nil {
 		return
 	}
@@ -440,9 +458,11 @@ func (p *Provider) trace(ctx context.Context, contents []*genai.Content, cfg *ge
 	var respJSON []byte
 	if err == nil {
 		respPayload := struct {
-			Text      string         `json:"text"`
-			ToolCalls []llm.ToolCall `json:"tool_calls,omitempty"`
-		}{text, toolCalls}
+			Text       string                                      `json:"text"`
+			ToolCalls  []llm.ToolCall                              `json:"tool_calls,omitempty"`
+			DurationMs int64                                       `json:"duration_ms"`
+			Usage      *genai.GenerateContentResponseUsageMetadata `json:"usage,omitempty"`
+		}{text, toolCalls, duration.Milliseconds(), usage}
 		if respJSON, marshalErr = json.MarshalIndent(respPayload, "", "  "); marshalErr != nil {
 			respJSON = []byte(fmt.Sprintf("(failed to marshal response: %v)", marshalErr))
 		}
