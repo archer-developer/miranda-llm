@@ -180,19 +180,13 @@ make test    # go test ./... -race
   loss of coverage.
 - `anthropic_test.go` covers the pure `toAnthropicTools`/`requiredFields`
   logic — same coverage as the original.
-- **`gemini_test.go` is deliberately leaner than the original.** The
-  original `miranda/internal/llm/gemini/gemini_test.go` (491 lines) drives
-  `Chat`/`pump`/`attempt` end-to-end against an `httptest.Server` standing
-  in for the real Gemini API (via the package's `apiBaseURL` override).
-  This repo's version only covers the pure functions that don't need a
-  live/mocked HTTP endpoint (`isRetryable`, `toLLMToolCall`,
-  `toGeminiContents`, `buildTools`, `New`'s fail-fast paths) — porting the
-  full HTTP-mocked streaming suite was out of scope for the initial
-  extraction. If you're relying on `gemini.Provider.Chat`/`Structured`'s
-  exact streaming/retry behavior being test-covered end-to-end, port the
-  rest of the original suite first (it's a mechanical adaptation — same
-  `apiBaseURL` var, same shape) or add equivalent coverage before treating
-  this package as fully verified.
+- `gemini_test.go` has full parity with the original
+  `miranda/internal/llm/gemini/gemini_test.go`: both the pure-function
+  tests (`isRetryable`, `toLLMToolCall`, `toGeminiContents`, `buildTools`,
+  `New`'s fail-fast paths) and the `httptest.Server`-backed end-to-end
+  suite driving `Chat`/`pump`/`attempt` (key rotation, live streaming,
+  thought-signature round-tripping) via the package's `apiBaseURL`
+  override — ported when `miranda` migrated onto this module.
 - No CI configured, matching this family — `make check` before every
   commit is the actual gate.
 
