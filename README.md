@@ -1,26 +1,16 @@
 # miranda-llm
 
-Shared LLM plumbing for Miranda's family of services: a provider-agnostic
-chat interface, multi-provider fallback/escalation routing, API-key
-rotation, request/response tracing, schema-constrained structured output,
-and text embeddings — extracted from [miranda](../miranda)'s
-`internal/llm` (the "brain" 's own LLM integration) into its own Go module
-so it can be imported by `miranda` itself and by every other Miranda
-microservice (starting with [miranda-medical-card](../miranda-medical-card))
-instead of being copy-pasted into each one.
+A shared Go library for talking to LLM providers. It gives you one
+provider-agnostic chat interface, plus the plumbing that tends to get
+copy-pasted between services that call LLMs: fallback and escalation
+routing across multiple providers, API-key rotation, request/response
+tracing, schema-constrained structured output, and text embeddings.
 
-**`miranda` has not been migrated onto this module yet.** This repo is a
-faithful extraction of `miranda/internal/llm`, `internal/keyrotation`, and
-`internal/llmtrace` as they existed at the time of extraction, decoupled
-from `miranda`'s own config package (see CLAUDE.md for exactly what
-changed) and extended with two capabilities `miranda` didn't have yet
-(Structured Output, Embeddings). Switching `miranda` itself to depend on
-this module instead of its own internal copy is a separate, independent
-task — until that happens, changes here and changes in `miranda`'s
-`internal/llm` can drift apart.
+It's a plain Go module — no `cmd/`, no config loader, no HTTP server. You
+import it, hand its constructors plain Go values, and wire it into your
+own service however you like.
 
-See `CLAUDE.md` for the full extraction rationale, what changed in the
-process, and package-by-package details.
+See `CLAUDE.md` for package-by-package implementation notes.
 
 ## Packages
 
@@ -37,18 +27,55 @@ github.com/archer-developer/miranda-llm/embedding     — Embedder interface + G
 github.com/archer-developer/miranda-llm/llmtest       — scriptable fakes for tests
 ```
 
-## Using this module from a service
+## Installing
 
 ```
 go get github.com/archer-developer/miranda-llm@latest
 ```
 
-This is a private repository — `go get`/`go mod tidy` need
-`GOPRIVATE=github.com/archer-developer/*` set in the environment so the Go
-toolchain fetches it directly via git instead of trying the public module
-proxy/checksum database.
+This is a private repository, so `go get`/`go mod tidy` need
+`GOPRIVATE=github.com/archer-developer/*` set in your environment —
+otherwise the Go toolchain will try to fetch it through the public module
+proxy and checksum database and fail.
 
-### Wiring a Router
+## Getting started: a simple chat call
+
+Everything starts with a `Provider`. Here's the smallest useful example,
+using Claude directly with no routing or fallback:
+
+```go
+import (
+	llm "github.com/archer-developer/miranda-llm"
+	"github.com/archer-developer/miranda-llm/anthropic"
+)
+
+provider := anthropic.New("claude", "claude-sonnet-5", apiKey, anthropic.ToolsConfig{})
+
+stream, err := provider.Chat(ctx, llm.ChatRequest{
+	Messages: []llm.Message{{Role: llm.RoleUser, Content: "Hello!"}},
+}, nil)
+for chunk := range stream {
+	// chunk.Text, chunk.ToolCalls, chunk.Err, ...
+}
+```
+
+That's enough for a single-provider integration. The rest of this README
+covers what to reach for once you need more than one provider, retries, or
+structured JSON output.
+
+## Talking to more than one provider: the Router
+
+Real deployments usually want a primary provider with a fallback (or a
+free-tier provider that can hand off to a paid one when it's out of
+capacity). `router.Router` wraps any number of `Provider`s with two
+behaviors:
+
+- **Reliability fallback** — if the current provider's call fails outright,
+  try the next one.
+- **Escalation** (optional) — a provider can expose an `escalate_to_X` tool
+  that the model itself may call mid-conversation to hand off to a
+  stronger model. This only makes sense for an open-ended chat/agent loop;
+  see below for why it's opt-in.
 
 ```go
 import (
@@ -89,30 +116,55 @@ for chunk := range stream {
 }
 ```
 
-### Structured output (Extraction / Planner / Summary-style calls)
+If you don't need escalation — for example, if your service only ever
+makes one-off calls with no open conversation for a model to hand off
+mid-generation — just pass `nil` for the escalations map. You still get
+reliability fallback across providers for free.
+
+## Getting JSON back instead of chat text: Structured output
+
+For extraction, planning, or "summarize this into a fixed shape" calls,
+you usually want JSON that matches a schema, not free-form chat text.
+`llm.StructuredProvider` (implemented by all three provider packages) and
+`router.Router.Structured` give you a single-shot call that enforces a
+JSON Schema on the response:
 
 ```go
 schema := map[string]any{
 	"type": "object",
 	"properties": map[string]any{
-		"diagnoses": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		"items": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
 	},
 }
 
 result, err := r.Structured(ctx, llm.StructuredRequest{
 	Messages:   []llm.Message{{Role: llm.RoleUser, Content: documentText}},
 	Schema:     schema,
-	SchemaName: "medical_extraction",
+	SchemaName: "extraction_result",
 })
 // result is json.RawMessage — unmarshal into your own Go type.
 ```
 
-`Structured` skips any configured provider that doesn't implement
-`llm.StructuredProvider` rather than treating it as a hard failure, so a
-mixed fallback chain works for `Chat` even if not every provider supports
-structured output.
+Each provider enforces the schema in whatever way its own API supports
+(native JSON-schema response modes for Gemini and OpenAI-compatible
+backends; a forced single tool call for Anthropic, which has no native
+equivalent). You don't need to know which — the interface is the same
+either way.
 
-### Embeddings
+Note that `Structured` only does plain reliability fallback, not
+escalation — a one-shot call has no open conversation for a model to
+reasonably decide it's out of its depth, and escalating away from a model
+you deliberately chose and tested against a schema would defeat the
+point. It also skips (rather than fails on) any configured provider that
+doesn't implement `StructuredProvider` at all, so you can safely mix a
+structured-capable primary with a chat-only backup — `Chat` calls still
+work across the whole chain.
+
+## Turning text into vectors: Embeddings
+
+Embeddings are a separate, simpler concept from chat — one text in, one
+vector out, no conversation or tools — so they live in their own package
+independent of everything above:
 
 ```go
 import "github.com/archer-developer/miranda-llm/embedding"
@@ -121,7 +173,9 @@ embedder, err := embedding.NewGemini(ctx, apiKey, "gemini-embedding-2")
 vector, err := embedder.Embed(ctx, "some text")
 ```
 
-### Testing your own code against this module
+## Testing code that depends on this module
+
+Use `llmtest` instead of hitting real providers in your tests:
 
 ```go
 import "github.com/archer-developer/miranda-llm/llmtest"
@@ -130,25 +184,27 @@ provider := llmtest.New("fake", llmtest.Response{Text: "hi"}).
 	WithStructured(llmtest.StructuredResponse{JSON: json.RawMessage(`{"ok":true}`)})
 ```
 
-See `llmtest.ChatOnlyProvider` for testing fallback behavior against a
-provider that doesn't support structured output, and
-`llmtest.FakeEmbedder` for testing code that depends on `embedding.Embedder`.
+- `llmtest.ChatOnlyProvider` implements `Provider` but deliberately not
+  `StructuredProvider` — use it to test that your code correctly skips a
+  provider that can't do structured output.
+- `llmtest.FakeEmbedder` does the same for code that depends on
+  `embedding.Embedder`.
 
-## Local development against this module
+## Developing this module alongside a consuming service
 
-While iterating on both this module and a consuming service at the same
-time, use a [Go workspace](https://go.dev/ref/mod#workspaces) instead of a
-committed `replace` directive in the consumer's `go.mod`:
+If you're iterating on both this module and a service that imports it at
+the same time, use a [Go workspace](https://go.dev/ref/mod#workspaces)
+instead of adding a `replace` directive to the consumer's `go.mod`:
 
 ```
-go work init ./miranda-llm ./miranda-medical-card
+go work init ./miranda-llm ./your-service
 ```
 
 With a `go.work` file present, `go build`/`go test` in the consuming
 service resolve your local, uncommitted changes to this module directly —
-no need to tag a release and bump `go.mod` on every iteration. Remove or
-don't commit `go.work` once you're done; it's a local override, not part of
-the module's real dependency graph.
+no need to tag a release and bump `go.mod` on every iteration. Don't
+commit `go.work`; it's a local override, not part of the module's real
+dependency graph.
 
 ## Building and testing
 
@@ -160,8 +216,8 @@ make check   # fmt + lint + test — run this before every commit
 ```
 
 `make tools` installs `golangci-lint` and `goimports` if they're not
-already on `PATH`. There is no CI configured, matching every other service
-in this family — `make check` is the enforcement mechanism.
+already on `PATH`. There is no CI configured — `make check` is the
+enforcement mechanism.
 
 ## Requires
 
