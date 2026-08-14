@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/stretchr/testify/require"
 
 	llm "github.com/archer-developer/miranda-llm"
@@ -46,4 +47,37 @@ func TestRequiredFields(t *testing.T) {
 		"required": []any{"a", "b"},
 	}))
 	require.Nil(t, requiredFields(map[string]any{"type": "object"}))
+}
+
+// TestToAnthropicMessages_SingleSystemBlockGetsCacheBreakpoint covers the
+// common case (one caller-supplied RoleSystem message): it must still be
+// marked, since it's both first and last.
+func TestToAnthropicMessages_SingleSystemBlockGetsCacheBreakpoint(t *testing.T) {
+	system, _ := toAnthropicMessages([]llm.Message{
+		{Role: llm.RoleSystem, Content: "You are Miranda."},
+		{Role: llm.RoleUser, Content: "hi"},
+	})
+	require.Len(t, system, 1)
+	require.Equal(t, anthropic.NewCacheControlEphemeralParam(), system[0].CacheControl)
+}
+
+// TestToAnthropicMessages_CachesFirstSystemBlockNotLast reproduces the bug
+// this ADR fixes (docs/adr/system-prompt-caching.md in the miranda repo): a
+// caller sending a stable prefix (persona/memory) followed by a volatile
+// suffix (current time, different on every turn) needs the breakpoint on
+// the STABLE block. The old "mark the last block" behavior would instead
+// mark the volatile one — a breakpoint that can never hit twice, since its
+// content differs on every call — silently defeating caching for any
+// caller that adopts a multi-block system prompt.
+func TestToAnthropicMessages_CachesFirstSystemBlockNotLast(t *testing.T) {
+	system, _ := toAnthropicMessages([]llm.Message{
+		{Role: llm.RoleSystem, Content: "You are Miranda. Shared memory: ..."},
+		{Role: llm.RoleSystem, Content: "Current time: 2026-08-14 12:00 MSK."},
+		{Role: llm.RoleUser, Content: "hi"},
+	})
+	require.Len(t, system, 2)
+	require.Equal(t, anthropic.NewCacheControlEphemeralParam(), system[0].CacheControl,
+		"the stable (first) block must carry the breakpoint")
+	require.Zero(t, system[1].CacheControl,
+		"the volatile (last) block must NOT carry a breakpoint — its content differs every turn, so marking it would never hit")
 }

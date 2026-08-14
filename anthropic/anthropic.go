@@ -256,9 +256,22 @@ func (p *Provider) trace(ctx context.Context, params anthropic.MessageNewParams,
 // represented as user-role messages containing a tool_result block, per the
 // Anthropic Messages API convention (there is no dedicated "tool" role).
 //
-// A cache_control breakpoint is placed on the last system block so that the
-// system prompt is reused from Anthropic's prompt cache on subsequent turns
-// of the same conversation, reducing both latency and input-token cost.
+// A cache_control breakpoint is placed on the FIRST system block, not the
+// last. This is a deliberate convention with the caller, not an arbitrary
+// choice: a caller that sends more than one RoleSystem message is expected
+// to put the stable, byte-identical-across-turns content first (persona,
+// standing instructions, slow-changing context like remembered facts) and
+// any per-turn-volatile content (e.g. the current time, which changes on
+// essentially every turn) in later blocks — see
+// docs/adr/system-prompt-caching.md in the miranda repo for the caller-side
+// design this exists for. Marking the first block means Anthropic's
+// prefix-based prompt cache still hits on every subsequent turn even though
+// a later, deliberately-unmarked volatile block differs from turn to turn —
+// marking the last block (the old behavior) would instead put the
+// breakpoint on the one block guaranteed never to match, defeating caching
+// entirely for a multi-block caller. A caller that only ever sends a single
+// system message (the common case, and every caller before this) is
+// unaffected: that one block is both first and last.
 func toAnthropicMessages(msgs []llm.Message) ([]anthropic.TextBlockParam, []anthropic.MessageParam) {
 	var system []anthropic.TextBlockParam
 	var out []anthropic.MessageParam
@@ -314,12 +327,15 @@ func toAnthropicMessages(msgs []llm.Message) ([]anthropic.TextBlockParam, []anth
 		}
 	}
 
-	// Mark the last system block as a cache breakpoint. Anthropic renders the
-	// prompt in the order tools → system → messages, so this checkpoint covers
-	// the entire stable prefix (system prompt + any per-caller context) and
-	// prevents it from being re-priced on every subsequent turn.
+	// Mark the first system block as a cache breakpoint — see this
+	// function's doc comment for why first, not last. Anthropic renders the
+	// prompt in the order tools → system → messages, so this checkpoint
+	// covers the stable prefix (tools, already separately breakpointed by
+	// buildTools, plus this first system block) and prevents it from being
+	// re-priced on every subsequent turn, regardless of what any later
+	// system block contains.
 	if len(system) > 0 {
-		system[len(system)-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
+		system[0].CacheControl = anthropic.NewCacheControlEphemeralParam()
 	}
 
 	return system, out

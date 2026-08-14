@@ -21,6 +21,20 @@ import (
 type Role string
 
 const (
+	// RoleSystem messages may appear more than once in ChatRequest.Messages
+	// (every provider's own conversion — toAnthropicMessages,
+	// toGeminiContents, toOpenAIMessages — folds them into that provider's
+	// native "system instruction" shape, whether that's one field with
+	// multiple parts/blocks or several system-role chat messages). Callers
+	// that split a system prompt into more than one block should put
+	// stable, byte-identical-across-turns content FIRST and any
+	// per-turn-volatile content (e.g. the current time) in later blocks:
+	// anthropic.Provider places its prompt-cache breakpoint on the FIRST
+	// system block specifically so a later, deliberately-unmarked volatile
+	// block never defeats reuse of the stable one — see
+	// anthropic.toAnthropicMessages's doc comment and
+	// docs/adr/system-prompt-caching.md in the miranda repo for the
+	// caller-side design this convention exists for.
 	RoleSystem    Role = "system"
 	RoleUser      Role = "user"
 	RoleAssistant Role = "assistant"
