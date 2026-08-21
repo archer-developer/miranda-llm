@@ -42,7 +42,30 @@ mapping its own YAML config into them.
   don't rotate keys (single credential per client).
 - **`llmtrace`** — writes one framed block per provider call to an
   `io.Writer` (typically a log file the consuming service opens). A `nil
-  *Logger` is a valid no-op, so tracing is fully optional.
+  *Logger` is a valid no-op, so tracing is fully optional. `ContextTracer`
+  tees an extra, `ctx`-scoped tracer (`WithTracer`) alongside whatever
+  `Default` tracer is installed once, globally, at startup — lets a caller
+  scope something (e.g. `llmtrace/anomaly.Recorder`) to a single turn/request
+  despite `Router`/`Provider` wiring being process-wide.
+  - **`llmtrace/analyze`** — the reader/analyzer counterpart: parses
+    `llmtrace`'s own block format back into `Block`s (`ParseAll`/
+    `Accumulator`, whole-file or incremental), decodes Gemini/Anthropic
+    request/response shapes into human-readable summaries, and groups blocks
+    by conversation. Shared by both consuming services' own diagnostic CLIs
+    (`medical-dev llm-trace`, `miranda llm-trace`) and Miranda's web UI
+    backend, so none of them maintain their own copy of this parsing logic.
+  - **`llmtrace/anomaly`** — per-turn anomaly detection built on `analyze`:
+    `Recorder` (an `llm.Tracer` a caller attaches to one turn via
+    `ContextTracer`/`WithTracer` above) accumulates that turn's blocks;
+    `Detect` flags a slow call, a repeated tool call with identical
+    arguments, a call to a nonexistent tool, malformed tool arguments, a tool
+    execution error, or (via the caller-supplied `Outcome`, since the trace
+    text alone can't disambiguate the two) hitting an iteration cap or a
+    timeout. Both `internal/ask` (medical-card) and `internal/agent_loop`
+    (Miranda) wire this in to route a flagged turn's blocks to its own file
+    for manual review, rather than only being visible by chance in the
+    middle of `llm.log`'s normal traffic — see each service's own `CLAUDE.md`
+    for its "Reviewing `logs/anomalies/`" section.
 - **`gemini`, `anthropic`, `openaicompat`** — one `Provider` implementation
   each. `gemini.ToolsConfig`/`gemini.RotationConfig` and
   `anthropic.ToolsConfig` are this package's own config types.
