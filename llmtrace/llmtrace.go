@@ -17,11 +17,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	llm "github.com/archer-developer/miranda-llm"
 )
 
 type ctxKey int
 
-const conversationIDKey ctxKey = iota
+const (
+	conversationIDKey ctxKey = iota
+	tracerKey
+)
 
 // WithConversationID attaches a conversation id to ctx so any trace recorded
 // further down this call chain can be correlated with the rest of that
@@ -34,6 +39,20 @@ func WithConversationID(ctx context.Context, conversationID string) context.Cont
 func conversationIDFrom(ctx context.Context) string {
 	id, _ := ctx.Value(conversationIDKey).(string)
 	return id
+}
+
+// WithTracer attaches an additional tracer to ctx, scoped to whatever call
+// chain uses this ctx from here on — see ContextTracer for why this exists
+// (scoping a trace to a single turn/request despite the process-wide tracer
+// every Provider is wired to at startup via Router.SetTracer being shared,
+// global, and set exactly once).
+func WithTracer(ctx context.Context, t llm.Tracer) context.Context {
+	return context.WithValue(ctx, tracerKey, t)
+}
+
+func tracerFrom(ctx context.Context) llm.Tracer {
+	t, _ := ctx.Value(tracerKey).(llm.Tracer)
+	return t
 }
 
 // Logger writes one formatted block per traced call to an underlying
@@ -84,4 +103,32 @@ func (l *Logger) Trace(ctx context.Context, provider, request, response string, 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	_, _ = io.WriteString(l.w, b.String())
+}
+
+// ContextTracer wraps a process-wide Default tracer (typically a *Logger) and
+// tees each call to whatever extra tracer, if any, was attached to ctx via
+// WithTracer — without ever skipping Default. Install this in place of the
+// raw Default at startup (router.Router.SetTracer(&ContextTracer{Default:
+// llmtrace.New(w)})) so a caller further down the stack can scope an
+// additional tracer to a single turn/request (e.g. to record that turn's
+// blocks in memory for anomaly detection — see llmtrace/anomaly) despite
+// Router/Provider wiring their one tracer once, globally, at process
+// startup, shared by every concurrent turn: swapping Default itself would
+// race every other in-flight call, but attaching a per-call tracer to ctx is
+// exactly as safe as any other context value.
+type ContextTracer struct {
+	Default llm.Tracer
+}
+
+// Trace implements llm.Tracer. Default always sees every call, unchanged —
+// this is a pure addition, never a redirect, so existing behavior (the main
+// log file, the live web UI trace view) is unaffected by anything attached
+// via WithTracer.
+func (c *ContextTracer) Trace(ctx context.Context, provider, request, response string, err error) {
+	if c.Default != nil {
+		c.Default.Trace(ctx, provider, request, response, err)
+	}
+	if extra := tracerFrom(ctx); extra != nil {
+		extra.Trace(ctx, provider, request, response, err)
+	}
 }

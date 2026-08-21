@@ -91,6 +91,72 @@ func (o *openBlock) finalize() Block {
 	return b
 }
 
+// NewBlock builds a Block directly from a traced call's raw
+// request/response/err — the same derivation openBlock.finalize applies to
+// parsed log text, but for a caller that already has these values in hand
+// without ever going through a log line (e.g. llmtrace/anomaly.Recorder,
+// which taps a call via llmtrace.WithTracer before Logger.Trace serializes
+// it to text at all).
+func NewBlock(t time.Time, provider, conversation, request, response string, err error) Block {
+	b := Block{
+		Time:         t,
+		Provider:     provider,
+		Conversation: conversation,
+		Request:      request,
+	}
+	if err != nil {
+		b.IsError = true
+		b.ErrorText = err.Error()
+	} else {
+		b.Response = response
+	}
+	if json.Valid([]byte(request)) {
+		b.RequestJSON = json.RawMessage(request)
+	}
+	if !b.IsError && json.Valid([]byte(response)) {
+		b.ResponseJSON = json.RawMessage(response)
+	}
+	return b
+}
+
+// FormatBlock renders b back into the exact block-text shape
+// llmtrace.Logger.Trace originally wrote it in — the inverse of
+// openBlock.finalize — so a block read, filtered, or built in memory here
+// (e.g. llmtrace/anomaly's anomaly-file writer, or a "copy trace" UI action)
+// round-trips through ParseAll/Feed identically to the original log.
+func FormatBlock(b Block) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "=== %s provider=%s", b.Time.Format(time.RFC3339), b.Provider)
+	if b.Conversation != "" {
+		fmt.Fprintf(&sb, " conversation=%s", b.Conversation)
+	}
+	sb.WriteString(" ===\n")
+
+	sb.WriteString(requestMarker + "\n")
+	sb.WriteString(b.Request)
+	sb.WriteString("\n")
+
+	sb.WriteString(responseMarker + "\n")
+	if b.IsError {
+		sb.WriteString(errorPrefix + b.ErrorText + "\n")
+	} else {
+		sb.WriteString(b.Response)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
+// WriteBlocks renders blocks back-to-back, in order, via FormatBlock.
+func WriteBlocks(w io.Writer, blocks []Block) error {
+	for _, b := range blocks {
+		if _, err := io.WriteString(w, FormatBlock(b)); err != nil {
+			return fmt.Errorf("analyze: write block: %w", err)
+		}
+	}
+	return nil
+}
+
 // Accumulator is a stateful, incremental reassembler: call Feed once per raw
 // text line, in arrival order, and it returns a finished Block the instant a
 // line completes one (the blank line terminating a block), and ok=false for

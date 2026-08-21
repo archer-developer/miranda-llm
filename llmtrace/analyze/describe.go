@@ -219,6 +219,51 @@ func DescribeOutgoing(b Block) []string {
 	return []string{"(unrecognized response shape) " + Truncate(b.Response, 200)}
 }
 
+// ToolCall is one tool call the model made in a block's response, decoded
+// from whichever provider shape the response matches. Args is left in
+// whatever raw shape the provider used (Gemini's own already-serialized
+// arguments string, or Anthropic's "input" object re-marshaled to JSON) —
+// canonicalizing key order for exact-match comparison (see
+// llmtrace/anomaly's repeated-tool-call check) is the caller's job.
+type ToolCall struct {
+	Name string
+	Args string
+}
+
+// ExtractToolCalls returns every tool call the model made in b's response —
+// the structured counterpart of DescribeOutgoing's "call X(args)" lines,
+// used where a caller needs the name/arguments themselves rather than a
+// formatted preview (e.g. detecting the model calling the same tool with the
+// same arguments more than once in a turn).
+func ExtractToolCalls(b Block) []ToolCall {
+	var resp geminiChatResponse
+	if json.Unmarshal([]byte(b.Response), &resp) == nil && (resp.Text != "" || len(resp.ToolCalls) > 0) {
+		var out []ToolCall
+		for _, tc := range resp.ToolCalls {
+			out = append(out, ToolCall{Name: tc.Name, Args: tc.Arguments})
+		}
+		return out
+	}
+
+	var anth struct {
+		Content []map[string]any `json:"content"`
+	}
+	if json.Unmarshal([]byte(b.Response), &anth) == nil && len(anth.Content) > 0 {
+		var out []ToolCall
+		for _, block := range anth.Content {
+			if block["type"] != "tool_use" {
+				continue
+			}
+			name, _ := block["name"].(string)
+			input, _ := json.Marshal(block["input"])
+			out = append(out, ToolCall{Name: name, Args: string(input)})
+		}
+		return out
+	}
+
+	return nil
+}
+
 // EndsOnToolCallWithNoAnswer reports whether b's response is entirely tool
 // call(s) with no final text — the shape a conversation that got cut off
 // mid-loop (iteration cap, timeout, crash) always ends on.

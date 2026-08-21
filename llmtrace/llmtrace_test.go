@@ -78,3 +78,62 @@ func TestTrace_SerializesConcurrentWrites(t *testing.T) {
 	// exactly 20 well-formed "=== ..." header lines.
 	require.Equal(t, 20, strings.Count(buf.String(), "=== "))
 }
+
+// fakeTracer records every Trace call it receives, for asserting
+// ContextTracer's tee behavior below.
+type fakeTracer struct {
+	calls int
+}
+
+func (f *fakeTracer) Trace(ctx context.Context, provider, request, response string, err error) {
+	f.calls++
+}
+
+func TestContextTracer_AlwaysCallsDefault(t *testing.T) {
+	var buf bytes.Buffer
+	ct := &ContextTracer{Default: New(&buf)}
+
+	ct.Trace(context.Background(), "local", "req", "resp", nil)
+
+	require.Contains(t, buf.String(), "provider=local")
+}
+
+func TestContextTracer_TeesToTracerAttachedViaContext(t *testing.T) {
+	var buf bytes.Buffer
+	extra := &fakeTracer{}
+	ct := &ContextTracer{Default: New(&buf)}
+
+	ctx := WithTracer(context.Background(), extra)
+	ct.Trace(ctx, "local", "req", "resp", nil)
+
+	require.Contains(t, buf.String(), "provider=local", "Default must still receive the call")
+	require.Equal(t, 1, extra.calls, "the ctx-attached tracer must also receive the call")
+}
+
+func TestContextTracer_NoExtraTracerIsJustDefault(t *testing.T) {
+	var buf bytes.Buffer
+	ct := &ContextTracer{Default: New(&buf)}
+
+	// No WithTracer in this ctx — must not panic, must behave exactly like
+	// calling Default directly.
+	require.NotPanics(t, func() {
+		ct.Trace(context.Background(), "local", "req", "resp", nil)
+	})
+	require.Contains(t, buf.String(), "provider=local")
+}
+
+func TestContextTracer_UnrelatedContextValuesDontLeakAcrossTurns(t *testing.T) {
+	var buf bytes.Buffer
+	extraA := &fakeTracer{}
+	extraB := &fakeTracer{}
+	ct := &ContextTracer{Default: New(&buf)}
+
+	ctxA := WithTracer(context.Background(), extraA)
+	ctxB := WithTracer(context.Background(), extraB)
+
+	ct.Trace(ctxA, "local", "req", "resp", nil)
+	ct.Trace(ctxB, "local", "req", "resp", nil)
+
+	require.Equal(t, 1, extraA.calls)
+	require.Equal(t, 1, extraB.calls)
+}

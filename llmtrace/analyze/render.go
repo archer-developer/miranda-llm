@@ -15,17 +15,17 @@ func RenderConversationSummary(w io.Writer, blocks []Block) {
 	untagged := CountUntagged(blocks)
 
 	if len(summaries) == 0 {
-		fmt.Fprintln(w, "No conversation-tagged blocks found (the agent loop wasn't called while tracing was on).")
+		_, _ = fmt.Fprintln(w, "No conversation-tagged blocks found (the agent loop wasn't called while tracing was on).")
 	} else {
-		fmt.Fprintf(w, "%-28s %-16s %-6s %-7s %s\n", "CONVERSATION", "PROVIDER", "TURNS", "ERRORS", "STARTED")
+		_, _ = fmt.Fprintf(w, "%-28s %-16s %-6s %-7s %s\n", "CONVERSATION", "PROVIDER", "TURNS", "ERRORS", "STARTED")
 		for _, s := range summaries {
-			fmt.Fprintf(w, "%-28s %-16s %-6d %-7d %s\n", s.ID, s.Provider, s.Turns, s.Errors, s.FirstSeen.Time.Format(time.RFC3339))
+			_, _ = fmt.Fprintf(w, "%-28s %-16s %-6d %-7d %s\n", s.ID, s.Provider, s.Turns, s.Errors, s.FirstSeen.Time.Format(time.RFC3339))
 		}
 	}
 	if untagged > 0 {
-		fmt.Fprintf(w, "\n(%d untagged block(s) — Document Pipeline calls and/or stateless agent-loop questions (no session id); pass --untagged to see them)\n", untagged)
+		_, _ = fmt.Fprintf(w, "\n(%d untagged block(s) — Document Pipeline calls and/or stateless agent-loop questions (no session id); pass --untagged to see them)\n", untagged)
 	}
-	fmt.Fprintln(w, "\nPass --conversation <id> or --latest for the turn-by-turn table.")
+	_, _ = fmt.Fprintln(w, "\nPass --conversation <id> or --latest for the turn-by-turn table.")
 }
 
 // RenderConversationDetail writes the turn-by-turn table for one tagged
@@ -36,7 +36,7 @@ func RenderConversationDetail(w io.Writer, blocks []Block, conversationID string
 		return fmt.Errorf("no blocks found for conversation %q", conversationID)
 	}
 
-	fmt.Fprintf(w, "Conversation %s — %d turn(s), provider=%s\n\n", conversationID, len(turns), turns[0].Provider)
+	_, _ = fmt.Fprintf(w, "Conversation %s — %d turn(s), provider=%s\n\n", conversationID, len(turns), turns[0].Provider)
 	renderTurns(w, turns)
 	return nil
 }
@@ -52,12 +52,12 @@ func RenderUntagged(w io.Writer, blocks []Block, tail int) error {
 	}
 
 	groups := GroupByConversationStart(turns)
-	fmt.Fprintf(w, "Untagged (stateless) — last %d block(s) across %d question(s), provider=%s\n\n", len(turns), len(groups), turns[len(turns)-1].Provider)
+	_, _ = fmt.Fprintf(w, "Untagged (stateless) — last %d block(s) across %d question(s), provider=%s\n\n", len(turns), len(groups), turns[len(turns)-1].Provider)
 	for i, g := range groups {
 		if i > 0 {
-			fmt.Fprintln(w)
+			_, _ = fmt.Fprintln(w)
 		}
-		fmt.Fprintf(w, "--- question at %s ---\n", g[0].Time.Format("15:04:05"))
+		_, _ = fmt.Fprintf(w, "--- question at %s ---\n", g[0].Time.Format("15:04:05"))
 		renderTurns(w, g)
 	}
 	return nil
@@ -73,24 +73,24 @@ func renderTurns(w io.Writer, turns []Block) {
 		ts := b.Time.Format("15:04:05")
 		in, _ := DescribeIncoming(b, i == 0)
 		if len(in) == 0 {
-			fmt.Fprintf(w, "%2d %s\n", i+1, ts)
+			_, _ = fmt.Fprintf(w, "%2d %s\n", i+1, ts)
 		} else {
-			fmt.Fprintf(w, "%2d %s  <- %s\n", i+1, ts, in[0])
+			_, _ = fmt.Fprintf(w, "%2d %s  <- %s\n", i+1, ts, in[0])
 			for _, extra := range in[1:] {
-				fmt.Fprintf(w, "      <- %s\n", extra)
+				_, _ = fmt.Fprintf(w, "      <- %s\n", extra)
 			}
 		}
 		if b.ErrorText != "" {
-			fmt.Fprintf(w, "      !! ERROR: %s\n", Truncate(b.ErrorText, 300))
+			_, _ = fmt.Fprintf(w, "      !! ERROR: %s\n", Truncate(b.ErrorText, 300))
 			continue
 		}
 		for _, out := range DescribeOutgoing(b) {
-			fmt.Fprintf(w, "      -> %s\n", out)
+			_, _ = fmt.Fprintf(w, "      -> %s\n", out)
 		}
 	}
 
 	last := turns[len(turns)-1]
 	if last.ErrorText == "" && EndsOnToolCallWithNoAnswer(last) {
-		fmt.Fprintln(w, "\nNote: conversation ends on a tool call with no final answer — likely hit the agent loop's iteration cap or the request was cut off before finishing.")
+		_, _ = fmt.Fprintln(w, "\nNote: conversation ends on a tool call with no final answer — likely hit the agent loop's iteration cap or the request was cut off before finishing.")
 	}
 }
