@@ -240,6 +240,8 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 	var textBuf strings.Builder // accumulated only for tracing, not for forwarding
 	var toolCalls []llm.ToolCall
 	var usage *genai.GenerateContentResponseUsageMetadata
+	var finishReason genai.FinishReason
+	var finishMessage string
 	forwarded := false
 
 	for resp, streamErr := range client.Models.GenerateContentStream(ctx, p.model, contents, cfg) {
@@ -265,6 +267,13 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 			usage = resp.UsageMetadata
 		}
 		for _, cand := range resp.Candidates {
+			// Populated only on the stream's terminal chunk for this
+			// candidate, so this naturally ends up holding the final
+			// finish reason once the loop exits.
+			if cand.FinishReason != "" {
+				finishReason = cand.FinishReason
+				finishMessage = cand.FinishMessage
+			}
 			if cand.Content == nil {
 				continue
 			}
@@ -282,6 +291,27 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 				}
 			}
 		}
+	}
+
+	// A finish reason other than STOP (or unset, meaning Gemini never
+	// populated it) means the response was curtailed — most commonly
+	// MAX_TOKENS, observed in practice on OCR transcription calls where
+	// the model's internal "thinking" tokens consumed nearly the entire
+	// output budget before any of the actual transcription was written,
+	// silently truncating mid-sentence with no error. Left unchecked, a
+	// caller sees exactly the same TextDelta/Done sequence as a genuinely
+	// complete response — there is no way for it to tell partial output
+	// from whole output apart. Treating this as a terminal (non-retryable:
+	// a different API key won't change the model's own output budget)
+	// error lets callers like extraction.OCR's ocrWithEscalation react to
+	// it — escalating to a different provider — instead of unknowingly
+	// feeding truncated text into everything downstream.
+	if finishReason != "" && finishReason != genai.FinishReasonStop {
+		p.logger.Error("gemini: request finished abnormally, response may be incomplete", "provider", p.name, "key_index", keyIndex, "finishReason", finishReason, "finishMessage", finishMessage)
+		wrapped := fmt.Errorf("gemini: response incomplete (finishReason=%s): %s", finishReason, finishMessage)
+		p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, time.Since(start), usage, wrapped)
+		out <- llm.StreamChunk{Err: wrapped}
+		return errAttemptWritten
 	}
 
 	p.logger.Info("gemini: request succeeded", "provider", p.name, "key_index", keyIndex, "duration_ms", time.Since(start).Milliseconds())

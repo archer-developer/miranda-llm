@@ -511,6 +511,44 @@ func TestGemini_DoesNotRetryAfterPartialForward(t *testing.T) {
 	require.Equal(t, 1, requestCount(), "must not rotate to the next key once output has already been forwarded")
 }
 
+// TestGemini_MaxTokensFinishReasonReturnsError is the regression test for
+// the real OCR truncation this adapter previously missed entirely: Gemini
+// stops generating once it hits its output token budget (frequently
+// exhausted by internal "thinking" tokens before any of the actual answer
+// is written) and reports finishReason=MAX_TOKENS on the stream's terminal
+// chunk, but the stream itself still ends cleanly — no streamErr, nothing
+// that isRetryable would ever see. Before this test existed, attempt()
+// never looked at FinishReason at all and forwarded a Done chunk exactly as
+// if the response were complete, so extraction.OCR (and anything else built
+// on Chat) had no way to tell a truncated transcription apart from a whole
+// one. A different API key wouldn't change the model's own output budget,
+// so this must be terminal, not retried.
+func TestGemini_MaxTokensFinishReasonReturnsError(t *testing.T) {
+	script := []scriptedResponse{
+		{events: []string{sseEvent(t, map[string]any{
+			"candidates": []map[string]any{
+				{
+					"content":      map[string]any{"role": "model", "parts": []map[string]any{{"text": "boilerplate consent preamble, then cut off mid-"}}},
+					"finishReason": "MAX_TOKENS",
+				},
+			},
+		})}},
+		// A second scripted entry that would fail the test via
+		// newTestServer's t.Fatalf if it were ever requested — proof a
+		// truncated-but-error-free finish doesn't rotate to the next key.
+		{events: []string{textEvent(t, "should never be reached")}},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "transcribe this"}}})
+	require.NoError(t, err)
+	gotErr := collectErr(t, ch)
+
+	require.Error(t, gotErr)
+	require.Contains(t, gotErr.Error(), "MAX_TOKENS")
+	require.Equal(t, 1, requestCount(), "must not rotate keys — a different key doesn't change the model's own output budget")
+}
+
 // TestGemini_RotatesOnAuthError and TestGemini_RotatesOnForbiddenError are
 // the regression tests for broadening isRetryable to per-key auth failures
 // (401/403): a revoked/disabled/individually-restricted key is a property
