@@ -49,6 +49,34 @@ func TestRequiredFields(t *testing.T) {
 	require.Nil(t, requiredFields(map[string]any{"type": "object"}))
 }
 
+// TestToAnthropicMessages_ToolCallWithEmptyOrMalformedArgumentsStillSendsInput
+// reproduces a production 400 ("messages.N.content.0.tool_use.input: Field
+// required"): a synthetic escalation tool call (router.escalateOnError) or
+// any tool call with empty/invalid Arguments used to leave input as a nil
+// interface, and the SDK drops "input" from the wire request entirely for a
+// nil input — Anthropic requires the field on every tool_use block, even an
+// empty object, and rejects the whole request otherwise.
+func TestToAnthropicMessages_ToolCallWithEmptyOrMalformedArgumentsStillSendsInput(t *testing.T) {
+	for _, args := range []string{"", "not valid json", `{"reason":"has a literal` + "\n" + `newline"}`} {
+		_, msgs := toAnthropicMessages([]llm.Message{
+			{Role: llm.RoleAssistant, ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "escalate_to_claude", Arguments: args}}},
+		})
+		require.Len(t, msgs, 1)
+
+		raw, err := json.Marshal(msgs[0])
+		require.NoError(t, err)
+
+		var decoded map[string]any
+		require.NoError(t, json.Unmarshal(raw, &decoded))
+		content, ok := decoded["content"].([]any)
+		require.True(t, ok)
+		require.Len(t, content, 1)
+		block, ok := content[0].(map[string]any)
+		require.True(t, ok)
+		require.Contains(t, block, "input", "tool_use block must always carry an input field, got Arguments=%q", args)
+	}
+}
+
 // TestToAnthropicMessages_SingleSystemBlockGetsCacheBreakpoint covers the
 // common case (one caller-supplied RoleSystem message): it must still be
 // marked, since it's both first and last.

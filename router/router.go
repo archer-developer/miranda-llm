@@ -342,10 +342,21 @@ func (r *Router) escalate(ctx context.Context, req llm.ChatRequest, call llm.Too
 // history, and escalate's own hop-cap/cycle guards apply identically) with
 // providerErr's message standing in for the model's own stated reason.
 func (r *Router) escalateOnError(ctx context.Context, req llm.ChatRequest, providerErr error, esc EscalationConfig, out chan<- llm.StreamChunk, report func(string), visited map[string]bool) {
+	// json.Marshal, not a hand-built string: providerErr's message is
+	// arbitrary provider-supplied text (a Gemini quota error embeds real
+	// newlines, for example) and Sprintf-ing it straight into a JSON
+	// literal produces invalid JSON whenever it contains a quote, newline,
+	// or other character JSON requires escaped.
+	args, err := json.Marshal(map[string]string{
+		"reason": fmt.Sprintf("previous provider failed: %s", providerErr.Error()),
+	})
+	if err != nil {
+		args = []byte(`{"reason":"previous provider failed"}`)
+	}
 	call := llm.ToolCall{
 		ID:        "error-escalation",
 		Name:      esc.ToolName,
-		Arguments: fmt.Sprintf(`{"reason":"previous provider failed: %s"}`, providerErr.Error()),
+		Arguments: string(args),
 	}
 	r.escalate(ctx, req, call, esc, out, report, visited)
 }

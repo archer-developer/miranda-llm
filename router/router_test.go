@@ -3,6 +3,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -148,6 +149,39 @@ func TestRouter_EscalatesToTargetProviderOnStreamError(t *testing.T) {
 	require.Len(t, msgs, 3)
 	require.Equal(t, llm.RoleAssistant, msgs[1].Role)
 	require.Equal(t, "escalate_to_claude", msgs[1].ToolCalls[0].Name)
+}
+
+func TestRouter_StreamErrorEscalationArgumentsAreValidJSONEvenWithUnsafeErrorText(t *testing.T) {
+	// Regression test: a real Gemini quota error embeds literal newlines
+	// (and often quotes) in its message text, e.g.
+	// "...billing details. \n* Quota exceeded...". escalateOnError used to
+	// Sprintf that text straight into a hand-built JSON literal, producing
+	// invalid JSON for the synthetic tool call's Arguments — which then
+	// silently became a nil/missing "input" once converted to a target
+	// provider's wire format (see anthropic.toAnthropicMessages), and
+	// Anthropic's API rejects a tool_use block with no "input" outright.
+	escalations := map[string]EscalationConfig{
+		"gemini-strong": {Enabled: true, ToolName: "escalate_to_claude", TargetProvider: "claude"},
+	}
+
+	unsafeErr := errors.New("quota exceeded, please check your plan.\n* Retry in \"37s\".")
+	strong := llmtest.New("gemini-strong", llmtest.Response{StreamErr: unsafeErr})
+	claude := llmtest.New("claude", llmtest.Response{Text: "ok"})
+
+	r, err := New([]llm.Provider{strong, claude}, escalations, "")
+	require.NoError(t, err)
+
+	ch, err := r.Chat(context.Background(), llm.ChatRequest{
+		Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, "ok", drainText(t, ch))
+
+	require.Len(t, claude.Requests, 1)
+	args := claude.Requests[0].Messages[1].ToolCalls[0].Arguments
+	var decoded map[string]string
+	require.NoError(t, json.Unmarshal([]byte(args), &decoded), "escalation Arguments must be valid JSON, got: %s", args)
+	require.Contains(t, decoded["reason"], "quota exceeded")
 }
 
 func TestRouter_StreamErrorEscalationDoesNotReescalateToVisitedProvider(t *testing.T) {

@@ -315,10 +315,15 @@ func toAnthropicMessages(msgs []llm.Message) ([]anthropic.TextBlockParam, []anth
 				blocks = append(blocks, anthropic.NewTextBlock(m.Content))
 			}
 			for _, tc := range m.ToolCalls {
-				var input any
+				// input defaults to an empty object, not nil: Anthropic's API
+				// requires a tool_use block's "input" field to be present
+				// (even `{}` for an argumentless call), and a nil input
+				// serializes with the field omitted entirely, which the API
+				// rejects outright. Empty or malformed Arguments (the latter
+				// best-effort — malformed JSON here shouldn't fail the whole
+				// request) both fall back to this same default.
+				input := any(map[string]any{})
 				if tc.Arguments != "" {
-					// Best-effort: malformed arguments just become a nil input
-					// rather than failing the whole request.
 					_ = json.Unmarshal([]byte(tc.Arguments), &input)
 				}
 				blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, input, tc.Name))
