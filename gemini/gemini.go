@@ -242,6 +242,7 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 	var usage *genai.GenerateContentResponseUsageMetadata
 	var finishReason genai.FinishReason
 	var finishMessage string
+	var promptFeedback *genai.GenerateContentResponsePromptFeedback
 	forwarded := false
 
 	for resp, streamErr := range client.Models.GenerateContentStream(ctx, p.model, contents, cfg) {
@@ -265,6 +266,9 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 		}
 		if resp.UsageMetadata != nil {
 			usage = resp.UsageMetadata
+		}
+		if resp.PromptFeedback != nil {
+			promptFeedback = resp.PromptFeedback
 		}
 		for _, cand := range resp.Candidates {
 			// Populated only on the stream's terminal chunk for this
@@ -293,22 +297,52 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 		}
 	}
 
-	// A finish reason other than STOP (or unset, meaning Gemini never
-	// populated it) means the response was curtailed — most commonly
-	// MAX_TOKENS, observed in practice on OCR transcription calls where
-	// the model's internal "thinking" tokens consumed nearly the entire
-	// output budget before any of the actual transcription was written,
-	// silently truncating mid-sentence with no error. Left unchecked, a
-	// caller sees exactly the same TextDelta/Done sequence as a genuinely
-	// complete response — there is no way for it to tell partial output
-	// from whole output apart. Treating this as a terminal (non-retryable:
-	// a different API key won't change the model's own output budget)
-	// error lets callers like extraction.OCR's ocrWithEscalation react to
-	// it — escalating to a different provider — instead of unknowingly
-	// feeding truncated text into everything downstream.
-	if finishReason != "" && finishReason != genai.FinishReasonStop {
+	// A prompt-level block (PromptFeedback.BlockReason set) means Gemini
+	// never got as far as generating candidates at all — most plausibly
+	// its safety filter tripping on sensitive content in the accumulated
+	// conversation (observed in practice on a turn whose prior tool result
+	// had just placed a full lab-report table, tied to an already-known
+	// pregnancy/health condition, into context). The stream still ends
+	// with no streamErr and zero forwarded content, so left unchecked this
+	// falls straight through to the "succeeded" path below with an empty
+	// Done chunk — indistinguishable, from the caller's side, from the
+	// model genuinely having nothing to say. Checked before the
+	// finishReason case since a prompt-level block leaves candidates
+	// empty, so finishReason would never be populated either.
+	if promptFeedback != nil && promptFeedback.BlockReason != "" {
+		p.logger.Error("gemini: request blocked at prompt level", "provider", p.name, "key_index", keyIndex, "blockReason", promptFeedback.BlockReason, "blockReasonMessage", promptFeedback.BlockReasonMessage)
+		wrapped := fmt.Errorf("gemini: prompt blocked (blockReason=%s): %s", promptFeedback.BlockReason, promptFeedback.BlockReasonMessage)
+		p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, time.Since(start), usage, wrapped)
+		out <- llm.StreamChunk{Err: wrapped}
+		return errAttemptWritten
+	}
+
+	// A finish reason other than STOP means the response was curtailed —
+	// most commonly MAX_TOKENS, observed in practice on OCR transcription
+	// calls where the model's internal "thinking" tokens consumed nearly
+	// the entire output budget before any of the actual transcription was
+	// written, silently truncating mid-sentence with no error. Left
+	// unchecked, a caller sees exactly the same TextDelta/Done sequence as
+	// a genuinely complete response — there is no way for it to tell
+	// partial output from whole output apart. Treating this as a terminal
+	// (non-retryable: a different API key won't change the model's own
+	// output budget) error lets callers like extraction.OCR's
+	// ocrWithEscalation react to it — escalating to a different provider —
+	// instead of unknowingly feeding truncated text into everything
+	// downstream.
+	//
+	// An unset finishReason with nothing ever forwarded is folded into the
+	// same abnormal case: a real completion always populates it (to STOP,
+	// at minimum) on the stream's terminal chunk, so seeing neither text
+	// nor a tool call NOR a finish reason means the stream ended having
+	// produced literally nothing recognizable — observed directly on a
+	// live gemini-lite call (candidates present, all with nil Content, no
+	// finishReason on any of them, no PromptFeedback either) that this
+	// condition used to let through as a "successful" empty reply, which
+	// then reached the end user as a blank message.
+	if finishReason != genai.FinishReasonStop && (finishReason != "" || !forwarded) {
 		p.logger.Error("gemini: request finished abnormally, response may be incomplete", "provider", p.name, "key_index", keyIndex, "finishReason", finishReason, "finishMessage", finishMessage)
-		wrapped := fmt.Errorf("gemini: response incomplete (finishReason=%s): %s", finishReason, finishMessage)
+		wrapped := fmt.Errorf("gemini: response incomplete (finishReason=%q): %s", finishReason, finishMessage)
 		p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, time.Since(start), usage, wrapped)
 		out <- llm.StreamChunk{Err: wrapped}
 		return errAttemptWritten

@@ -212,3 +212,33 @@ func TestDetect_IterationCapAndTimeoutAreIndependent(t *testing.T) {
 	got := Detect(nil, nil, Outcome{HitIterationCap: true, TimedOut: true, MaxIterations: 16}, Options{})
 	require.Len(t, got, 2)
 }
+
+// TestDetect_EmptyFinalResponse is the regression test for the real
+// incident that motivated KindEmptyResponse: a turn's last call returns
+// neither text nor a tool call, with no error anywhere in the chain — the
+// shape that used to reach the end user as a silent blank reply with
+// nothing in logs/anomalies/ to explain why.
+func TestDetect_EmptyFinalResponse(t *testing.T) {
+	blocks := []analyze.Block{
+		questionBlock(t, "how am I doing"),
+		toolResultBlock(t, "lab_results", `{"cholesterol":"normal"}`, finalAnswerResponse("")),
+	}
+
+	got := Detect(blocks, nil, Outcome{}, Options{})
+	require.Len(t, got, 1)
+	require.Equal(t, KindEmptyResponse, got[0].Kind)
+}
+
+// TestDetect_EmptyResponseOnlyChecksLastBlock guards against
+// detectEmptyFinalResponse over-firing on an intermediate tool-call block —
+// runAgentLoop only ever treats a response with zero tool calls as final
+// (internal/agent_loop/agent_loop.go), so an empty-final-response anomaly
+// can structurally only occur on a turn's last block.
+func TestDetect_EmptyResponseOnlyChecksLastBlock(t *testing.T) {
+	blocks := []analyze.Block{
+		questionBlock(t, "how am I doing"), // ends on a tool call, not empty text
+		toolResultBlock(t, "lab_results", `{"cholesterol":"normal"}`, finalAnswerResponse("you're doing fine")),
+	}
+
+	require.Empty(t, Detect(blocks, nil, Outcome{}, Options{}))
+}

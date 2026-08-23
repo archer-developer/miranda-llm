@@ -172,6 +172,84 @@ error: gemini: request failed: 429 quota exceeded
 	require.Nil(t, blocks[0].ResponseJSON)
 }
 
+// TestIsEmptyResponse_GeminiShape is the regression test for the real
+// incident this check exists to catch: a gemini-shaped response with a
+// non-empty JSON envelope (usage/duration_ms present, matching what
+// gemini.Provider.trace always writes) but text="" and no tool_calls at
+// all — the model had the floor to answer and produced nothing.
+func TestIsEmptyResponse_GeminiShape(t *testing.T) {
+	log := `=== 2026-08-23T11:47:11Z provider=gemini-lite conversation=session_1 ===
+--- request ---
+{"contents":[{"role":"user","parts":[{"text":"Покажи анализ крови от 15.04.2025"}]}]}
+--- response ---
+{"text":"","duration_ms":844,"usage":{"promptTokenCount":14609,"totalTokenCount":14609}}
+
+=== 2026-08-23T11:47:12Z provider=gemini-lite conversation=session_1 ===
+--- request ---
+{"contents":[{"role":"user","parts":[{"text":"Покажи анализ крови от 15.04.2025"}]}]}
+--- response ---
+{"text":"Вот результаты...","tool_calls":null,"duration_ms":900}
+
+`
+	blocks, err := ParseAll(strings.NewReader(log))
+	require.NoError(t, err)
+	require.Len(t, blocks, 2)
+
+	require.True(t, IsEmptyResponse(blocks[0]), "text=\"\" with no tool_calls but a non-empty envelope must be flagged as an empty response")
+	require.False(t, IsEmptyResponse(blocks[1]), "a real text answer must not be flagged as empty")
+}
+
+// TestIsEmptyResponse_AnthropicShape mirrors the gemini case for the
+// anthropic response shape: an empty content array.
+func TestIsEmptyResponse_AnthropicShape(t *testing.T) {
+	log := `=== 2026-08-23T11:47:11Z provider=claude-escalation conversation=session_2 ===
+--- request ---
+{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"text","text":"q"}]}]}
+--- response ---
+{"id":"msg_1","content":[],"stop_reason":"end_turn"}
+
+=== 2026-08-23T11:47:12Z provider=claude-escalation conversation=session_2 ===
+--- request ---
+{"model":"claude-sonnet-5","messages":[{"role":"user","content":[{"type":"text","text":"q"}]}]}
+--- response ---
+{"id":"msg_2","content":[{"type":"text","text":"answer"}],"stop_reason":"end_turn"}
+
+`
+	blocks, err := ParseAll(strings.NewReader(log))
+	require.NoError(t, err)
+	require.Len(t, blocks, 2)
+
+	require.True(t, IsEmptyResponse(blocks[0]), "an empty content array must be flagged as an empty response")
+	require.False(t, IsEmptyResponse(blocks[1]))
+}
+
+// TestIsEmptyResponse_IgnoresErrorsAndTrivialObjects covers the two cases
+// IsEmptyResponse must NOT flag: a block that's already an explicit error
+// (a different, already-surfaced failure mode), and a bare "{}" — which no
+// real trace ever produces, but which would otherwise trivially match an
+// all-zero-value geminiChatResponse.
+func TestIsEmptyResponse_IgnoresErrorsAndTrivialObjects(t *testing.T) {
+	log := `=== 2026-08-23T11:47:11Z provider=gemini-agent conversation=session_3 ===
+--- request ---
+{"contents":[{"role":"user","parts":[{"text":"q"}]}]}
+--- response ---
+error: gemini: request failed: 429 quota exceeded
+
+=== 2026-08-23T11:47:12Z provider=gemini-agent conversation=session_3 ===
+--- request ---
+{"contents":[{"role":"user","parts":[{"text":"q"}]}]}
+--- response ---
+{}
+
+`
+	blocks, err := ParseAll(strings.NewReader(log))
+	require.NoError(t, err)
+	require.Len(t, blocks, 2)
+
+	require.False(t, IsEmptyResponse(blocks[0]), "an explicit error block is a different, already-surfaced failure mode")
+	require.False(t, IsEmptyResponse(blocks[1]), "a bare {} never comes from a real trace and must not be misread as this shape")
+}
+
 func TestLatestConversation_IgnoresUntaggedBlocks(t *testing.T) {
 	log := `=== 2026-08-12T18:00:00Z provider=gemini-document ===
 --- request ---

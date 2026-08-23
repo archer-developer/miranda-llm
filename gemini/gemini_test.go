@@ -549,6 +549,72 @@ func TestGemini_MaxTokensFinishReasonReturnsError(t *testing.T) {
 	require.Equal(t, 1, requestCount(), "must not rotate keys — a different key doesn't change the model's own output budget")
 }
 
+// TestGemini_PromptBlockedReturnsError is the regression test for a
+// prompt-level safety block: Gemini refuses to generate candidates at all
+// (most plausibly its safety filter tripping on sensitive content already
+// accumulated in the conversation — e.g. a prior tool result that placed a
+// full lab-report table into context) and reports PromptFeedback.BlockReason
+// instead of any per-candidate FinishReason. Before this test existed,
+// attempt() never looked at PromptFeedback and forwarded an empty Done chunk
+// exactly as if the model had genuinely nothing to say, so a caller (and
+// ultimately the end user) saw a silent blank reply with no error at all.
+func TestGemini_PromptBlockedReturnsError(t *testing.T) {
+	script := []scriptedResponse{
+		{events: []string{sseEvent(t, map[string]any{
+			"promptFeedback": map[string]any{"blockReason": "SAFETY"},
+		})}},
+		// A second scripted entry that would fail the test via
+		// newTestServer's t.Fatalf if it were ever requested — proof a
+		// prompt-level block doesn't rotate to the next key.
+		{events: []string{textEvent(t, "should never be reached")}},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "sensitive question"}}})
+	require.NoError(t, err)
+	gotErr := collectErr(t, ch)
+
+	require.Error(t, gotErr)
+	require.Contains(t, gotErr.Error(), "SAFETY")
+	require.Equal(t, 1, requestCount(), "must not rotate keys — a different key hits the same safety filter")
+}
+
+// TestGemini_EmptyResponseWithNoFinishReasonReturnsError is the regression
+// test for the real incident this adapter previously missed entirely: a
+// stream that ends with no streamErr, a candidate present but with nil
+// Content, and no FinishReason ever populated on any chunk (and no
+// PromptFeedback either) — observed directly on a live gemini-lite call.
+// Before this test existed, attempt()'s abnormal-finish check required
+// FinishReason to be non-empty to trip at all, so this exact shape fell
+// straight through to the "succeeded" path with an empty Done chunk,
+// reaching the end user as a blank reply with no error anywhere in the
+// chain.
+func TestGemini_EmptyResponseWithNoFinishReasonReturnsError(t *testing.T) {
+	script := []scriptedResponse{
+		{events: []string{sseEvent(t, map[string]any{
+			"candidates": []map[string]any{{}},
+			"usageMetadata": map[string]any{
+				"promptTokenCount": 14609,
+				"totalTokenCount":  14609,
+			},
+		})}},
+		// A second scripted entry that would fail the test via
+		// newTestServer's t.Fatalf if it were ever requested — proof this
+		// doesn't rotate to the next key (a different key won't change
+		// what the model decided to generate).
+		{events: []string{textEvent(t, "should never be reached")}},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "покажи анализ крови"}}})
+	require.NoError(t, err)
+	gotErr := collectErr(t, ch)
+
+	require.Error(t, gotErr)
+	require.Contains(t, gotErr.Error(), "response incomplete")
+	require.Equal(t, 1, requestCount())
+}
+
 // TestGemini_RotatesOnAuthError and TestGemini_RotatesOnForbiddenError are
 // the regression tests for broadening isRetryable to per-key auth failures
 // (401/403): a revoked/disabled/individually-restricted key is a property

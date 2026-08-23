@@ -296,6 +296,61 @@ func EndsOnToolCallWithNoAnswer(b Block) bool {
 	return false
 }
 
+// IsEmptyResponse reports whether b is a well-formed, non-error provider
+// response that nonetheless carries neither text nor a tool call — the
+// model's turn to answer, but nothing came out. Distinct from
+// EndsOnToolCallWithNoAnswer (which requires seeing at least a tool call)
+// and from DescribeOutgoing's "(unrecognized response shape)" fallback
+// (which is for responses that don't decode into either known shape at
+// all, e.g. genuinely malformed JSON): this is specifically a non-empty
+// JSON object that decodes cleanly into a known envelope — anthropic's
+// "content" key present (however empty), or gemini's absent — with zero
+// content inside it. Observed directly on a live gemini-lite call that
+// returned "usage" and "duration_ms" but text="" and no tool_calls at all,
+// which then reached the end user as a silent blank reply (see
+// gemini.Provider.attempt's own PromptFeedback/finishReason handling,
+// added specifically to stop that provider from producing this shape going
+// forward — this check exists as a caller-side safety net for the gap
+// before that fix is everywhere deployed, and for any other provider that
+// might exhibit the same "successful but empty" behavior). Requiring the
+// raw object to be non-empty (rather than gating on a specific field like
+// duration_ms) is what keeps a literal "{}" — which no real trace ever
+// produces, but which would otherwise trivially "match" an all-zero-value
+// geminiChatResponse — from being misread as this shape.
+func IsEmptyResponse(b Block) bool {
+	if b.IsError {
+		return false
+	}
+	var raw map[string]any
+	if json.Unmarshal([]byte(b.Response), &raw) != nil || len(raw) == 0 {
+		return false
+	}
+
+	if content, ok := raw["content"]; ok {
+		items, ok := content.([]any)
+		if !ok {
+			return false
+		}
+		for _, item := range items {
+			block, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch block["type"] {
+			case "text", "tool_use":
+				return false
+			}
+		}
+		return true
+	}
+
+	var resp geminiChatResponse
+	if json.Unmarshal([]byte(b.Response), &resp) != nil {
+		return false
+	}
+	return resp.Text == "" && len(resp.ToolCalls) == 0
+}
+
 // IsFirstTurn reports whether b's request is a conversation's very first
 // turn — exactly one content/message entry (just the question, no
 // accumulated tool-call history yet) — regardless of provider shape. The

@@ -18,6 +18,7 @@ const (
 	KindToolError        = "tool_error"
 	KindIterationCap     = "iteration_cap"
 	KindTimeout          = "timeout"
+	KindEmptyResponse    = "empty_response"
 )
 
 // Anomaly describes one issue found within a turn's trace blocks.
@@ -75,6 +76,7 @@ func Detect(blocks []analyze.Block, durations []time.Duration, outcome Outcome, 
 
 	anomalies = append(anomalies, detectRepeatedToolCalls(blocks)...)
 	anomalies = append(anomalies, detectToolResultErrors(blocks)...)
+	anomalies = append(anomalies, detectEmptyFinalResponse(blocks)...)
 
 	if outcome.HitIterationCap {
 		anomalies = append(anomalies, Anomaly{
@@ -121,6 +123,30 @@ func detectRepeatedToolCalls(blocks []analyze.Block) []Anomaly {
 		})
 	}
 	return out
+}
+
+// detectEmptyFinalResponse flags a turn whose very last call returned
+// neither text nor a tool call despite ending without an error — the model
+// had the floor to answer and produced nothing, which the agent loop can't
+// tell apart from a genuine (if unhelpful) empty reply, so it goes straight
+// to the end user as silence. Only the last block is checked: runAgentLoop
+// treats any response with zero tool calls as the turn's final answer and
+// returns immediately (internal/agent_loop/agent_loop.go), so this shape
+// can structurally only ever occur on a turn's last call — an empty
+// response mid-turn (with tool calls still following) is a different,
+// already-covered shape (see EndsOnToolCallWithNoAnswer/KindIterationCap).
+func detectEmptyFinalResponse(blocks []analyze.Block) []Anomaly {
+	if len(blocks) == 0 {
+		return nil
+	}
+	last := blocks[len(blocks)-1]
+	if !analyze.IsEmptyResponse(last) {
+		return nil
+	}
+	return []Anomaly{{
+		Kind:   KindEmptyResponse,
+		Detail: fmt.Sprintf("call %d: provider returned neither text nor a tool call — the user received an empty reply", len(blocks)),
+	}}
 }
 
 // canonicalizeArgs re-marshals arg JSON with sorted keys (encoding/json
