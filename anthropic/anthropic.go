@@ -2,23 +2,38 @@
 // top of the official github.com/anthropics/anthropic-sdk-go SDK, used
 // exclusively for Claude — it gets full native support for tool use,
 // streaming, and prompt caching, unlike routing Claude through an
-// OpenAI-compatibility shim.
+// OpenAI-compatibility shim. See the gemini package for the sibling adapter
+// this mirrors, including the same api_key_envs-driven key rotation (see
+// keyrotation, isRetryable) — rotates on quota (429) and per-key auth
+// errors (401/403), deliberately NOT on 5xx/529 (Anthropic's "overloaded")
+// server errors.
 package anthropic
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
-	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
 
 	llm "github.com/archer-developer/miranda-llm"
+	"github.com/archer-developer/miranda-llm/keyrotation"
 )
 
 const defaultMaxTokens = 4096
+
+// apiBaseURL overrides every anthropic.Client's base URL. It's a var, not a
+// const, so tests can point it at an httptest.Server instead of the real
+// Anthropic API — mirrors gemini.apiBaseURL. Empty (the default) means "use
+// the SDK's real Anthropic API endpoint".
+var apiBaseURL string
 
 // codeExecutionCaller identifies this provider's code execution tool
 // version in the AllowedCallers list of the web search/fetch tools, so
@@ -59,32 +74,79 @@ type ToolsConfig struct {
 	CodeExecution bool
 }
 
+// RotationConfig tunes this package's key-rotation. The zero value falls
+// back to keyrotation's built-in defaults (1 cycle, no cooldown). Mirrors
+// gemini.RotationConfig — same shape, same meaning.
+type RotationConfig struct {
+	CooldownSeconds int
+	MaxRetryCycles  int
+}
+
 // Provider is an llm.Provider (and llm.StructuredProvider) backed by the
-// native Anthropic Messages API.
+// native Anthropic Messages API. Like gemini.Provider, it holds one
+// anthropic.Client per configured key and rotates across them on a quota or
+// per-key auth error — see pump/attempt below.
 type Provider struct {
 	name      string
 	model     string
 	maxTokens int64
-	client    anthropic.Client
+	clients   []anthropic.Client // one per resolved API key, in configured order
 	tools     ToolsConfig
+	rotation  RotationConfig
 	tracer    llm.Tracer
+	logger    *slog.Logger
 }
 
-// New builds a Provider named name for the given Claude model. tools
+// New builds a Provider named name for the given Claude model, resolving
+// apiKeyEnvs to actual key values from the process environment (never
+// stored in the caller's own config file) and building one anthropic.Client
+// per resolved key up front — mirrors gemini.New. Fails fast if none of
+// apiKeyEnvs resolve to a non-empty value, since every subsequent
+// Chat/Structured call would otherwise fail identically anyway. tools
 // enables Claude's own server-executed web search/fetch/code-execution
 // tools on every request from this provider (see ToolsConfig).
-func New(name, model, apiKey string, tools ToolsConfig) *Provider {
-	opts := []option.RequestOption{}
-	if apiKey != "" {
-		opts = append(opts, option.WithAPIKey(apiKey))
+func New(name, model string, apiKeyEnvs []string, tools ToolsConfig, rotation RotationConfig, logger *slog.Logger) (*Provider, error) {
+	if logger == nil {
+		logger = slog.Default()
 	}
+
+	var clients []anthropic.Client
+	for _, env := range apiKeyEnvs {
+		key := os.Getenv(env)
+		if key == "" {
+			continue
+		}
+		// WithMaxRetries(0): the SDK's own default (2) retries 429/5xx
+		// transparently, on the SAME key, before an error ever reaches
+		// attempt/isRetryable — silently defeating the "don't rotate keys
+		// on a 5xx" fix below (isRetryable never even sees most 5xx
+		// responses, since the SDK already retried and only surfaces the
+		// error after its own retries are exhausted) and making
+		// keyrotation.Run's own retry/rotation logic redundant with a
+		// second, hidden retry layer operating on different rules. This
+		// package's own keyrotation.Run + isRetryable is the single,
+		// explicit place that decides what gets retried and how — mirrors
+		// gemini.Provider, whose SDK has no such built-in retry to begin
+		// with.
+		opts := []option.RequestOption{option.WithAPIKey(key), option.WithMaxRetries(0)}
+		if apiBaseURL != "" {
+			opts = append(opts, option.WithBaseURL(apiBaseURL))
+		}
+		clients = append(clients, anthropic.NewClient(opts...))
+	}
+	if len(clients) == 0 {
+		return nil, fmt.Errorf("anthropic: none of the configured api_key_envs %v are set", apiKeyEnvs)
+	}
+
 	return &Provider{
 		name:      name,
 		model:     model,
 		maxTokens: defaultMaxTokens,
-		client:    anthropic.NewClient(opts...),
+		clients:   clients,
 		tools:     tools,
-	}
+		rotation:  rotation,
+		logger:    logger,
+	}, nil
 }
 
 func (p *Provider) Name() string { return p.name }
@@ -99,7 +161,9 @@ func (p *Provider) SetTracer(t llm.Tracer) {
 	p.tracer = t
 }
 
-// Chat implements llm.Provider by streaming a Messages API response.
+// Chat implements llm.Provider by streaming a Messages API response,
+// rotating across configured API keys on a retryable error (see
+// pump/attempt).
 func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
 	system, messages := toAnthropicMessages(req.Messages)
 
@@ -112,42 +176,111 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.St
 		Temperature: toParamOpt(req.Temperature),
 	}
 
-	stream := p.client.Messages.NewStreaming(ctx, params)
-
 	out := make(chan llm.StreamChunk)
-	go p.pump(ctx, params, stream, out)
+	go p.pump(ctx, params, out)
 	return out, nil
 }
 
-// pump forwards text deltas as they arrive and uses the SDK's built-in
-// Message.Accumulate to reconstruct the full response, so tool_use blocks
-// (which the API streams as fragmented partial-JSON deltas) only need to be
-// read once, fully assembled, at the end of the stream. That same
-// accumulated message — including any server-side tool_use/tool_result
-// blocks Anthropic resolved on its own (web search/fetch, code execution) —
-// is what gets traced, so the trace reflects exactly what the API did, not
-// just the subset a caller's own tool loop sees.
-func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, stream *ssestream.Stream[anthropic.MessageStreamEventUnion], out chan<- llm.StreamChunk) {
+// pump rotates across p.clients (one per configured API key) via
+// keyrotation.Run using isRetryable (quota AND per-key auth failures only —
+// see its doc comment for why 5xx/529 is deliberately excluded), mirroring
+// gemini.Provider.pump.
+func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, out chan<- llm.StreamChunk) {
 	defer close(out)
 
+	rotCfg := keyrotation.Config{
+		Cycles:   p.rotation.MaxRetryCycles,
+		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
+	}
+	err := keyrotation.Run(ctx, p.logger, "anthropic", len(p.clients), rotCfg, isRetryable,
+		func(ctx context.Context, i int) error {
+			return p.attempt(ctx, i, params, out)
+		},
+	)
+	// errAttemptWritten means attempt already wrote its own terminal Err
+	// chunk before returning — writing a second one here would be a
+	// duplicate. Any other non-nil error (the rotation genuinely exhausted
+	// every key/cycle, or ctx was cancelled) still needs pump to report it,
+	// since nothing else has.
+	if err != nil && !errors.Is(err, errAttemptWritten) {
+		out <- llm.StreamChunk{Err: err}
+	}
+}
+
+// errAttemptWritten marks that attempt already sent its own terminal
+// StreamChunk{Err: ...} to out before returning — pump checks for this
+// sentinel specifically so it doesn't write a second Err chunk on top of
+// the one attempt already sent. isRetryable naturally treats it as
+// non-retryable too (it isn't an *anthropic.Error), so keyrotation.Run
+// stops rotating and returns it straight back to pump. Mirrors gemini's own
+// sentinel of the same name.
+var errAttemptWritten = errors.New("anthropic: attempt already wrote its terminal error")
+
+// attempt makes exactly one Messages.NewStreaming call against one client
+// (one API key), forwarding TextDelta chunks to out live as they stream in
+// and using the SDK's built-in Message.Accumulate to reconstruct the full
+// response, so tool_use blocks (which the API streams as fragmented
+// partial-JSON deltas) only need to be read once, fully assembled, at the
+// end of the stream. That same accumulated message — including any
+// server-side tool_use/tool_result blocks Anthropic resolved on its own
+// (web search/fetch, code execution) — is what gets traced, so the trace
+// reflects exactly what the API did, not just the subset a caller's own
+// tool loop sees.
+//
+// Once ANY text has been forwarded to out for this attempt, a later error
+// on the SAME attempt must not be retried even if isRetryable(err) would
+// otherwise say yes — rotating to another key re-runs the whole request
+// from scratch, and a caller that live-forwards chunks as they arrive has
+// no way to "unsay" one — mirrors gemini.Provider.attempt's own
+// forwarded-then-error rule.
+//
+// Returns nil once the response completes cleanly (having already written
+// Done to out). Returns errAttemptWritten in the two cases described above
+// (forwarded-then-error, or a non-retryable error) — both already wrote
+// their own Err chunk to out, so keyrotation.Run/pump must not retry or
+// double-report. Returns the raw streamErr only when nothing has been
+// forwarded yet AND isRetryable(streamErr) is true, so keyrotation.Run's
+// own isRetryable check agrees and tries the next key.
+func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.MessageNewParams, out chan<- llm.StreamChunk) error {
+	// NewStreaming performs the actual HTTP request eagerly (before this
+	// call returns), so a 429/401/403/5xx from the initial request surfaces
+	// via stream.Err() below exactly like a mid-stream error would — there
+	// is no separate "did the request even go out" error to check first.
+	stream := p.clients[keyIndex].Messages.NewStreaming(ctx, params)
+
 	var message anthropic.Message
+	forwarded := false
 	for stream.Next() {
 		event := stream.Current()
 		if err := message.Accumulate(event); err != nil {
 			wrapped := fmt.Errorf("anthropic: accumulate: %w", err)
-			out <- llm.StreamChunk{Err: wrapped}
+			p.logger.Error("anthropic: request failed", "provider", p.name, "key_index", keyIndex, "error", err)
 			p.trace(ctx, params, nil, wrapped)
-			return
+			out <- llm.StreamChunk{Err: wrapped}
+			return errAttemptWritten
 		}
 		if event.Type == "content_block_delta" && event.Delta.Text != "" {
+			forwarded = true
 			out <- llm.StreamChunk{TextDelta: event.Delta.Text}
 		}
 	}
-	if err := stream.Err(); err != nil {
-		wrapped := fmt.Errorf("anthropic: stream: %w", err)
-		out <- llm.StreamChunk{Err: wrapped}
+	if streamErr := stream.Err(); streamErr != nil {
+		if forwarded {
+			p.logger.Error("anthropic: request failed mid-stream after partial output, not retrying", "provider", p.name, "key_index", keyIndex, "error", streamErr)
+			wrapped := fmt.Errorf("anthropic: stream: %w", streamErr)
+			p.trace(ctx, params, nil, wrapped)
+			out <- llm.StreamChunk{Err: wrapped}
+			return errAttemptWritten
+		}
+		if isRetryable(streamErr) {
+			p.logger.Warn("anthropic: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", streamErr)
+			return streamErr
+		}
+		p.logger.Error("anthropic: request failed", "provider", p.name, "key_index", keyIndex, "error", streamErr)
+		wrapped := fmt.Errorf("anthropic: stream: %w", streamErr)
 		p.trace(ctx, params, nil, wrapped)
-		return
+		out <- llm.StreamChunk{Err: wrapped}
+		return errAttemptWritten
 	}
 
 	for _, block := range message.Content {
@@ -158,6 +291,34 @@ func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, 
 
 	p.trace(ctx, params, &message, nil)
 	out <- llm.StreamChunk{Done: true}
+	return nil
+}
+
+// isRetryable reports whether err is worth rotating to the next key for —
+// mirrors gemini.isRetryable's reasoning exactly, just against Anthropic's
+// own error shape (*anthropic.Error, an alias for the SDK's internal
+// apierror.Error, carrying StatusCode):
+//   - a quota/rate-limit error (HTTP 429) — quota is tracked per key, so a
+//     different configured key plausibly has budget left.
+//   - a per-key auth failure (HTTP 401 Unauthorized / 403 Forbidden) — a
+//     property of THAT key specifically, not of the request.
+//
+// A server-side error (HTTP 5xx, or Anthropic's own 529 "Overloaded" —
+// functionally a 5xx, just a non-standard code) is deliberately NOT
+// retried: the backend itself is struggling, so every configured key hits
+// the same wall and cycling through them just repeats the identical
+// failure — see gemini.isRetryable's doc comment for the production
+// incident (2026-08-27) this reasoning is shared with.
+func isRetryable(err error) bool {
+	var apiErr *anthropic.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.StatusCode {
+	case http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden:
+		return true
+	}
+	return false
 }
 
 // Structured implements llm.StructuredProvider. The Messages API has no
@@ -214,20 +375,46 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 		Temperature: toParamOpt(req.Temperature),
 	}
 
-	message, err := p.client.Messages.New(ctx, params)
-	if err != nil {
-		wrapped := fmt.Errorf("anthropic: structured: %w", err)
-		p.trace(ctx, params, nil, wrapped)
-		return nil, wrapped
+	// Rotates across configured API keys exactly like Chat's pump/attempt,
+	// via the same keyrotation.Run + isRetryable — one non-streaming call
+	// per attempted key (Messages.New), since a forced single tool call has
+	// no meaningful streaming granularity to forward.
+	var result json.RawMessage
+	rotCfg := keyrotation.Config{
+		Cycles:   p.rotation.MaxRetryCycles,
+		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
-	p.trace(ctx, params, message, nil)
+	err := keyrotation.Run(ctx, p.logger, "anthropic-structured", len(p.clients), rotCfg, isRetryable,
+		func(ctx context.Context, keyIndex int) error {
+			message, err := p.clients[keyIndex].Messages.New(ctx, params)
+			if err != nil {
+				if isRetryable(err) {
+					p.logger.Warn("anthropic: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", err)
+				} else {
+					p.logger.Error("anthropic: request failed", "provider", p.name, "key_index", keyIndex, "error", err)
+				}
+				p.trace(ctx, params, nil, fmt.Errorf("anthropic: structured: %w", err))
+				return err
+			}
+			p.trace(ctx, params, message, nil)
 
-	for _, block := range message.Content {
-		if block.Type == "tool_use" && block.Name == toolName {
-			return json.RawMessage(block.Input), nil
-		}
+			for _, block := range message.Content {
+				if block.Type == "tool_use" && block.Name == toolName {
+					result = json.RawMessage(block.Input)
+					return nil
+				}
+			}
+			// Not wrapped with an "anthropic: structured:" prefix here —
+			// the caller below adds it once, uniformly, for every failure
+			// path (this one and a raw API error alike) so the message
+			// never repeats the prefix twice.
+			return fmt.Errorf("model did not call the forced tool %q", toolName)
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic: structured: %w", err)
 	}
-	return nil, fmt.Errorf("anthropic: structured: model did not call the forced tool %q", toolName)
+	return result, nil
 }
 
 // trace serializes exactly what was sent (params, the same value passed to

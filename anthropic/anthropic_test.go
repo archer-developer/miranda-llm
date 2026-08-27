@@ -1,7 +1,12 @@
 package anthropic
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -138,4 +143,290 @@ func TestToAnthropicMessages_CachesFirstSystemBlockNotLast(t *testing.T) {
 		"the stable (first) block must carry the breakpoint")
 	require.Zero(t, system[1].CacheControl,
 		"the volatile (last) block must NOT carry a breakpoint — its content differs every turn, so marking it would never hit")
+}
+
+// --- Below: the httptest.Server-backed key-rotation suite, mirroring
+// gemini_test.go's own — see isRetryable's doc comment for the reasoning
+// this exercises (429/401/403 rotate, 5xx does not).
+
+func TestIsRetryable(t *testing.T) {
+	require.True(t, isRetryable(&anthropic.Error{StatusCode: http.StatusTooManyRequests}))
+	require.True(t, isRetryable(&anthropic.Error{StatusCode: http.StatusUnauthorized}))
+	require.True(t, isRetryable(&anthropic.Error{StatusCode: http.StatusForbidden}))
+
+	// 5xx (and Anthropic's own 529 "Overloaded") is deliberately NOT
+	// retryable: every configured key hits the same overloaded backend, so
+	// rotating keys just repeats the identical failure — see isRetryable's
+	// doc comment.
+	require.False(t, isRetryable(&anthropic.Error{StatusCode: http.StatusInternalServerError}))
+	require.False(t, isRetryable(&anthropic.Error{StatusCode: http.StatusServiceUnavailable}))
+	require.False(t, isRetryable(&anthropic.Error{StatusCode: 529}))
+
+	require.False(t, isRetryable(&anthropic.Error{StatusCode: http.StatusBadRequest}))
+	require.False(t, isRetryable(errors.New("some unrelated network error")))
+}
+
+// scriptedResponse is one fake server reply, in the order Chat's/
+// Structured's rotation loop will request them: a successful SSE stream
+// (body, for Chat's NewStreaming), a successful plain JSON message
+// (jsonBody, for Structured's non-streaming Messages.New — needs its own
+// Content-Type: application/json, unlike the SSE case), or an HTTP error
+// status with an Anthropic-shaped {"type":"error","error":{...}} body.
+type scriptedResponse struct {
+	body       string
+	jsonBody   string
+	statusCode int
+	errBody    string
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	require.NoError(t, err)
+	return string(b)
+}
+
+// anthropicSuccessBody builds the minimal well-formed SSE event sequence
+// (message_start -> content_block_start -> content_block_delta ->
+// content_block_stop -> message_delta -> message_stop) Message.Accumulate
+// requires — each event needs its predecessor to have run (e.g.
+// content_block_delta needs a content_block_start at the same index first),
+// so a partial/ad-hoc event list fails accumulation outright rather than
+// just under-reporting text.
+func anthropicSuccessBody(t *testing.T, text string) string {
+	t.Helper()
+	var sb []string
+	sb = append(sb, "event: message_start\ndata: "+mustJSON(t, map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id": "msg_test", "type": "message", "role": "assistant", "model": "claude-test-model",
+			"content": []any{}, "stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 1, "output_tokens": 0},
+		},
+	})+"\n\n")
+	sb = append(sb, "event: content_block_start\ndata: "+mustJSON(t, map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	})+"\n\n")
+	sb = append(sb, "event: content_block_delta\ndata: "+mustJSON(t, map[string]any{
+		"type": "content_block_delta", "index": 0,
+		"delta": map[string]any{"type": "text_delta", "text": text},
+	})+"\n\n")
+	sb = append(sb, "event: content_block_stop\ndata: "+mustJSON(t, map[string]any{"type": "content_block_stop", "index": 0})+"\n\n")
+	sb = append(sb, "event: message_delta\ndata: "+mustJSON(t, map[string]any{
+		"type":  "message_delta",
+		"delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil},
+		"usage": map[string]any{"output_tokens": 5},
+	})+"\n\n")
+	sb = append(sb, "event: message_stop\ndata: "+mustJSON(t, map[string]any{"type": "message_stop"})+"\n\n")
+
+	out := ""
+	for _, s := range sb {
+		out += s
+	}
+	return out
+}
+
+// quotaErrorBody is a 429 rate_limit_error response body.
+const quotaErrorBody = `{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`
+
+// serverErrorBody is Anthropic's own "overloaded" response body — a 5xx-shaped
+// failure by another name (see isRetryable's doc comment).
+const serverErrorBody = `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`
+
+// badRequestBody is a non-retryable 400 response body.
+const badRequestBody = `{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}`
+
+func newTestServer(t *testing.T, script []scriptedResponse) func() int {
+	t.Helper()
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		if idx >= len(script) {
+			t.Fatalf("newTestServer: got more requests (%d) than scripted responses (%d)", idx+1, len(script))
+		}
+		resp := script[idx]
+		if resp.statusCode != 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.statusCode)
+			_, _ = w.Write([]byte(resp.errBody))
+			return
+		}
+		if resp.jsonBody != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(resp.jsonBody))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(resp.body))
+	}))
+	t.Cleanup(ts.Close)
+
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	t.Cleanup(func() { apiBaseURL = original })
+
+	return func() int { return requestCount }
+}
+
+func newTestProvider(t *testing.T, n int, script []scriptedResponse, rotation RotationConfig) (*Provider, func() int) {
+	t.Helper()
+	requestCount := newTestServer(t, script)
+
+	envs := make([]string, n)
+	for i := range n {
+		env := fmt.Sprintf("ANTHROPIC_TEST_KEY_%d", i)
+		t.Setenv(env, fmt.Sprintf("fake-key-%d", i))
+		envs[i] = env
+	}
+
+	p, err := New("anthropic-test", "claude-test-model", envs, ToolsConfig{}, rotation, nil)
+	require.NoError(t, err)
+	return p, requestCount
+}
+
+type collected struct {
+	Text      string
+	ToolCalls []llm.ToolCall
+}
+
+func collect(t *testing.T, ch <-chan llm.StreamChunk) collected {
+	t.Helper()
+	var out collected
+	for chunk := range ch {
+		require.NoError(t, chunk.Err)
+		out.Text += chunk.TextDelta
+		if chunk.ToolCall != nil {
+			out.ToolCalls = append(out.ToolCalls, *chunk.ToolCall)
+		}
+	}
+	return out
+}
+
+func collectErr(t *testing.T, ch <-chan llm.StreamChunk) error {
+	t.Helper()
+	var gotErr error
+	for chunk := range ch {
+		if chunk.Err != nil {
+			gotErr = chunk.Err
+		}
+	}
+	return gotErr
+}
+
+func TestAnthropicNew_NoKeysConfiguredErrors(t *testing.T) {
+	_, err := New("anthropic-test", "claude-test-model", []string{"ANTHROPIC_TEST_UNSET_ENV_VAR"}, ToolsConfig{}, RotationConfig{}, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "none of the configured api_key_envs")
+}
+
+func TestAnthropic_RotatesOnQuotaError(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{body: anthropicSuccessBody(t, "hi from key 2")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.Equal(t, 2, requestCount(), "exactly one request per key, no needless extra cycling")
+}
+
+// TestAnthropic_ServerErrorFailsImmediatelyWithoutRotating is the Anthropic
+// counterpart to gemini's TestGemini_ServerErrorFailsImmediatelyWithoutRotating
+// — same production incident (2026-08-27), same fix, different provider.
+func TestAnthropic_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		// A second scripted entry that would fail the test via
+		// newTestServer's t.Fatalf if it were ever requested — proof a 5xx
+		// does not rotate to the next key.
+		{body: anthropicSuccessBody(t, "should never be reached")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	gotErr := collectErr(t, ch)
+
+	require.Error(t, gotErr)
+	require.Equal(t, 1, requestCount(), "a 5xx must not rotate to the next key")
+}
+
+func TestAnthropic_NonRetryableErrorFailsImmediately(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusBadRequest, errBody: badRequestBody},
+		{body: anthropicSuccessBody(t, "should never be reached")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	gotErr := collectErr(t, ch)
+
+	require.Error(t, gotErr)
+	require.Equal(t, 1, requestCount(), "a non-retryable error must not rotate to the next key")
+}
+
+func TestAnthropic_RotatesOnAuthError(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusUnauthorized, errBody: `{"type":"error","error":{"type":"authentication_error","message":"invalid key"}}`},
+		{body: anthropicSuccessBody(t, "hi from key 2")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.Equal(t, 2, requestCount())
+}
+
+func TestAnthropic_AllKeysExhaustedAfterCycles(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{MaxRetryCycles: 2, CooldownSeconds: 0})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	gotErr := collectErr(t, ch)
+
+	require.Error(t, gotErr)
+	require.Contains(t, gotErr.Error(), "exhausted")
+	require.Equal(t, 4, requestCount(), "2 keys x 2 cycles")
+}
+
+func TestAnthropic_StructuredRotatesOnQuotaError(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{jsonBody: mustJSON(t, map[string]any{
+			"id": "msg_test", "type": "message", "role": "assistant", "model": "claude-test-model",
+			"content": []map[string]any{
+				{"type": "tool_use", "id": "toolu_1", "name": "structured_output", "input": map[string]any{"ok": true}},
+			},
+			"stop_reason": "tool_use", "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+		})},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	raw, err := p.Structured(context.Background(), llm.StructuredRequest{
+		Messages:   []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+		Schema:     map[string]any{"type": "object", "properties": map[string]any{"ok": map[string]any{"type": "boolean"}}},
+		SchemaName: "structured_output",
+	})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"ok":true}`, string(raw))
+	require.Equal(t, 2, requestCount())
 }
