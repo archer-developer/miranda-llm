@@ -6,8 +6,8 @@
 // not wired — see nativeTools's doc comment, it's Vertex AI-only on the
 // generateContent API this package calls). See the anthropic package for
 // the sibling adapter this mirrors, and keyrotation for the API-key-rotation
-// shape this uses — broadened here to rotate on quota, server, AND per-key
-// auth errors, not just quota — see isRetryable.
+// shape this uses — rotates on quota (429) and per-key auth errors
+// (401/403), deliberately NOT on 5xx server errors — see isRetryable.
 package gemini
 
 import (
@@ -176,10 +176,8 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.St
 }
 
 // pump rotates across p.clients (one per configured API key) via
-// keyrotation.Run; isRetryable is broad (quota AND 5xx AND per-key auth
-// failures, see its doc comment) since a conversational turn can't just
-// drop the whole turn on a transient upstream failure the way a single
-// fire-and-forget request can afford to fail loudly.
+// keyrotation.Run using isRetryable (quota AND per-key auth failures only —
+// see its doc comment for why 5xx is deliberately excluded).
 func (p *Provider) pump(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig, out chan<- llm.StreamChunk) {
 	defer close(out)
 
@@ -463,8 +461,8 @@ func toLLMToolCall(fc *genai.FunctionCall, thoughtSignature []byte, index int) l
 
 // isRetryable reports whether err is worth rotating to the next key for:
 //   - a quota/rate-limit error (HTTP 429, or APIError.Status ==
-//     "RESOURCE_EXHAUSTED")
-//   - a server-side error (HTTP 5xx)
+//     "RESOURCE_EXHAUSTED") — quota is tracked per key, so a different
+//     configured key plausibly has budget left.
 //   - a per-key auth failure (HTTP 401 Unauthorized / 403 Forbidden) — this
 //     is a property of THAT key specifically (revoked, disabled, or a
 //     per-key restriction hit independent of quota), not of the request,
@@ -474,8 +472,22 @@ func toLLMToolCall(fc *genai.FunctionCall, thoughtSignature []byte, index int) l
 //     below — rotating keys only helps when the fault is IN the key, not
 //     in what's being asked.
 //
+// A server-side error (HTTP 5xx, e.g. 503 "high demand") is deliberately
+// NOT retried here, even though an earlier version of this function treated
+// it the same as a quota error. A 5xx means the backend itself is
+// struggling — every configured key hits the same overloaded service, so
+// cycling through all of them just repeats the identical failure N times
+// (each with its own latency) before eventually giving up — found in
+// production (2026-08-27): a single 503 during OCR turned into 4 back-to-back
+// 503s, one per configured key, delaying the actual escalation to a
+// different provider by several times over. The right response to a 5xx is
+// the caller's own cross-provider escalation (e.g.
+// extraction.ocrWithEscalation falling over from Gemini to Claude), not
+// key rotation within Gemini — so isRetryable now returns false here and
+// lets the first 5xx surface immediately.
+//
 // Any other error (a malformed request, or a network failure before any
-// HTTP response came back) is not retried: cycling keys can't fix a
+// HTTP response came back) is not retried either: cycling keys can't fix a
 // request that's simply wrong.
 func isRetryable(err error) bool {
 	var apiErr genai.APIError
@@ -486,10 +498,7 @@ func isRetryable(err error) bool {
 	case http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusForbidden:
 		return true
 	}
-	if apiErr.Status == "RESOURCE_EXHAUSTED" {
-		return true
-	}
-	return apiErr.Code >= 500 && apiErr.Code < 600
+	return apiErr.Status == "RESOURCE_EXHAUSTED"
 }
 
 // trace serializes the actual request (contents + cfg) and response (text +

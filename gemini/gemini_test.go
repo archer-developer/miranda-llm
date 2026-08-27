@@ -22,8 +22,12 @@ func TestIsRetryable(t *testing.T) {
 	require.True(t, isRetryable(genai.APIError{Code: http.StatusUnauthorized}))
 	require.True(t, isRetryable(genai.APIError{Code: http.StatusForbidden}))
 	require.True(t, isRetryable(genai.APIError{Status: "RESOURCE_EXHAUSTED"}))
-	require.True(t, isRetryable(genai.APIError{Code: http.StatusInternalServerError}))
-	require.True(t, isRetryable(genai.APIError{Code: http.StatusServiceUnavailable}))
+
+	// 5xx is deliberately NOT retryable: every configured key hits the same
+	// overloaded backend, so rotating keys just repeats the identical
+	// failure instead of helping — see isRetryable's doc comment.
+	require.False(t, isRetryable(genai.APIError{Code: http.StatusInternalServerError}))
+	require.False(t, isRetryable(genai.APIError{Code: http.StatusServiceUnavailable}))
 
 	require.False(t, isRetryable(genai.APIError{Code: http.StatusBadRequest}))
 	require.False(t, isRetryable(errors.New("some unrelated network error")))
@@ -366,24 +370,30 @@ func TestGemini_RotatesOnQuotaError(t *testing.T) {
 	require.Equal(t, 2, requestCount(), "exactly one request per key, no needless extra cycling")
 }
 
-func TestGemini_RotatesOnServerError(t *testing.T) {
-	// This is the direct regression test for broadening rotation beyond a
-	// quota-only trigger: a plain 503 (no RESOURCE_EXHAUSTED status) must
-	// still rotate to the next key. Don't "fix" this back to match a
-	// narrower quota-only trigger — it's intentional, per this adapter's
-	// requirement.
+// TestGemini_ServerErrorFailsImmediatelyWithoutRotating reproduces a
+// production incident (2026-08-27): a plain 503 ("high demand") during OCR
+// rotated through all 4 configured keys, getting the identical 503 from
+// each one before finally failing — since the backend itself is
+// overloaded, every key hits the same wall, so rotating just multiplies the
+// latency of a failure that was never going to succeed on any key. A 5xx
+// must fail on the first key so the caller's own cross-provider escalation
+// (e.g. extraction.ocrWithEscalation) kicks in promptly instead.
+func TestGemini_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
 	script := []scriptedResponse{
 		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
-		{events: []string{textEvent(t, "hi from key 2")}},
+		// A second scripted entry that would fail the test via
+		// newTestServer's t.Fatalf if it were ever requested — proof a 5xx
+		// does not rotate to the next key.
+		{events: []string{textEvent(t, "should never be reached")}},
 	}
 	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
 
 	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
 	require.NoError(t, err)
-	got := collect(t, ch)
+	gotErr := collectErr(t, ch)
 
-	require.Equal(t, "hi from key 2", got.Text)
-	require.Equal(t, 2, requestCount())
+	require.Error(t, gotErr)
+	require.Equal(t, 1, requestCount(), "a 5xx must not rotate to the next key")
 }
 
 func TestGemini_NonRetryableErrorFailsImmediately(t *testing.T) {
