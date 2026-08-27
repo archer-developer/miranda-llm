@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -429,4 +430,44 @@ func TestAnthropic_StructuredRotatesOnQuotaError(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"ok":true}`, string(raw))
 	require.Equal(t, 2, requestCount())
+}
+
+// TestAnthropic_ChatNeverForwardsTemperature reproduces a production 400
+// (2026-08-27): extraction.OCR always sets ChatRequest.Temperature
+// explicitly (0.1, to keep Gemini from wandering off mid-transcription)
+// with no way to know at call time whether Gemini or an escalated Claude
+// call ends up handling the request — a current Claude model hard-rejects
+// the `temperature` field outright ("deprecated for this model") for any
+// value at all, so every OCR call that escalated to Claude 400'd. Chat must
+// never put "temperature" on the wire, even when the caller explicitly
+// sets one — see Chat's own doc comment for the full incident.
+func TestAnthropic_ChatNeverForwardsTemperature(t *testing.T) {
+	var capturedBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		capturedBody = string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(anthropicSuccessBody(t, "ok")))
+	}))
+	defer ts.Close()
+
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("ANTHROPIC_TEST_TEMP_KEY", "fake-key")
+	p, err := New("anthropic-test", "claude-test-model", []string{"ANTHROPIC_TEST_TEMP_KEY"}, ToolsConfig{}, RotationConfig{}, nil)
+	require.NoError(t, err)
+
+	temp := 0.1
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{
+		Messages:    []llm.Message{{Role: llm.RoleUser, Content: "hi"}},
+		Temperature: &temp,
+	})
+	require.NoError(t, err)
+	collect(t, ch)
+
+	require.NotContains(t, capturedBody, "temperature", "Chat must never forward Temperature to the Anthropic API")
 }

@@ -21,7 +21,6 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/anthropics/anthropic-sdk-go/packages/param"
 
 	llm "github.com/archer-developer/miranda-llm"
 	"github.com/archer-developer/miranda-llm/keyrotation"
@@ -46,17 +45,10 @@ const codeExecutionCaller = "code_execution_20260521"
 // StructuredRequest.SchemaName is empty.
 const defaultStructuredToolName = "structured_output"
 
-// toParamOpt converts an optional float64 to the param.Opt[float64] the SDK
-// wants. Returns the zero value (omitted, per the `omitzero` tag on
-// MessageNewParams.Temperature) when v is nil, so the API's own default
-// applies — matches Chat's existing behavior for a nil
-// ChatRequest.Temperature.
-func toParamOpt(v *float64) param.Opt[float64] {
-	if v == nil {
-		return param.Opt[float64]{}
-	}
-	return anthropic.Float(*v)
-}
+// llm.ChatRequest.Temperature/llm.StructuredRequest.Temperature are
+// deliberately never forwarded to the API from this provider (see Chat's
+// and Structured's own doc comments) — there is no toParamOpt-style
+// converter here on purpose, unlike gemini/openaicompat.
 
 // ToolsConfig toggles which of Claude's native server-side tools are sent
 // on every request from this provider. All default to false (opt-in) since
@@ -164,16 +156,29 @@ func (p *Provider) SetTracer(t llm.Tracer) {
 // Chat implements llm.Provider by streaming a Messages API response,
 // rotating across configured API keys on a retryable error (see
 // pump/attempt).
+//
+// req.Temperature is deliberately never forwarded to the API — see
+// Structured's own doc comment for the full production incident this
+// mirrors (a current Claude model hard-rejects the `temperature` field
+// outright, "deprecated for this model", for any value at all, not just an
+// out-of-range one). Found here specifically (2026-08-27) via
+// extraction.OCR: it always sets ChatRequest.Temperature explicitly
+// (0.1, to keep Gemini from wandering off mid-transcription — see
+// ocrTemperature's own doc comment in that package) with no way to know at
+// call time which provider will actually handle the request, so every OCR
+// call that escalated from Gemini to Claude 400'd outright. Structured's
+// fix (stop substituting a default when nil) only ever worked because no
+// caller happened to set an explicit value — this is the same bug, just
+// finally hit by a caller that does.
 func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.StreamChunk, error) {
 	system, messages := toAnthropicMessages(req.Messages)
 
 	params := anthropic.MessageNewParams{
-		Model:       anthropic.Model(p.model),
-		MaxTokens:   p.maxTokens,
-		System:      system,
-		Messages:    messages,
-		Tools:       p.buildTools(req.Tools),
-		Temperature: toParamOpt(req.Temperature),
+		Model:     anthropic.Model(p.model),
+		MaxTokens: p.maxTokens,
+		System:    system,
+		Messages:  messages,
+		Tools:     p.buildTools(req.Tools),
 	}
 
 	out := make(chan llm.StreamChunk)
@@ -330,20 +335,26 @@ func isRetryable(err error) bool {
 // call (Messages.New), since a forced single tool call has no meaningful
 // streaming granularity to forward.
 //
-// Unlike Gemini/OpenAI-compatible Structured, this deliberately does NOT
-// substitute a default temperature when req.Temperature is nil (see
-// llm.StructuredRequest.Temperature's doc comment for why other providers
-// do) — toParamOpt passes it straight through, omitted when nil, same as
-// Chat. Observed in production (2026-08-09): a request that set
-// Temperature at all — including the "low, for determinism" default this
-// provider used to substitute — got a 400 from a current Claude model
+// Unlike Gemini/OpenAI-compatible Structured, req.Temperature is never
+// forwarded to the API at all here, not even when the caller sets one
+// explicitly (see llm.StructuredRequest.Temperature's doc comment for why
+// other providers do substitute a "low, for determinism" default when
+// nil). Observed in production (2026-08-09): a request that set
+// Temperature at all — including the low default this provider used to
+// substitute internally — got a 400 from a current Claude model
 // ("`temperature` is deprecated for this model"), which made every
 // Structured call against that model fail outright, escalation included.
 // Since the parameter is being rejected wholesale rather than validated by
-// range, there's no safe non-nil value left to fall back to here; only
-// omitting it works. A caller that still wants deterministic structured
-// output from Claude has no lever for that via this field anymore — accept
-// whatever sampling behavior the model's own default is.
+// range, there's no safe non-nil value left to fall back to here — the
+// field is dropped unconditionally instead (see Chat's own doc comment for
+// the sibling incident this same reasoning applies to: an even simpler
+// initial fix here that merely stopped substituting a default, rather than
+// dropping the field outright, only ever worked because no caller happened
+// to set an explicit non-nil Temperature — extraction.OCR does, and hit
+// this exact 400 the moment its Chat call escalated to Claude). A caller
+// that still wants deterministic output from Claude has no lever for that
+// via this field anymore — accept whatever sampling behavior the model's
+// own default is.
 func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (json.RawMessage, error) {
 	system, messages := toAnthropicMessages(req.Messages)
 
@@ -366,13 +377,12 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 	}
 
 	params := anthropic.MessageNewParams{
-		Model:       anthropic.Model(p.model),
-		MaxTokens:   p.maxTokens,
-		System:      system,
-		Messages:    messages,
-		Tools:       []anthropic.ToolUnionParam{tool},
-		ToolChoice:  anthropic.ToolChoiceParamOfTool(toolName),
-		Temperature: toParamOpt(req.Temperature),
+		Model:      anthropic.Model(p.model),
+		MaxTokens:  p.maxTokens,
+		System:     system,
+		Messages:   messages,
+		Tools:      []anthropic.ToolUnionParam{tool},
+		ToolChoice: anthropic.ToolChoiceParamOfTool(toolName),
 	}
 
 	// Rotates across configured API keys exactly like Chat's pump/attempt,
