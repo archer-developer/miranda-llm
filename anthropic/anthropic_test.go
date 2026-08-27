@@ -77,6 +77,36 @@ func TestToAnthropicMessages_ToolCallWithEmptyOrMalformedArgumentsStillSendsInpu
 	}
 }
 
+// TestToAnthropicMessages_PDFPartUsesDocumentBlockNotImageBlock reproduces a
+// production 400 (2026-08-27): OCR's ContentPart carries MIMEType
+// "application/pdf" straight from the caller's file — valid for Gemini's
+// inlineData, but Claude only accepts image/jpeg|png|gif|webp in an image
+// block and hard-rejects anything else. A PDF part must become a document
+// block instead, so OCR escalation to Claude actually works for PDF input.
+func TestToAnthropicMessages_PDFPartUsesDocumentBlockNotImageBlock(t *testing.T) {
+	_, msgs := toAnthropicMessages([]llm.Message{
+		{Role: llm.RoleUser, Parts: []llm.ContentPart{{ImageBase64: "ZmFrZS1wZGY=", MIMEType: "application/pdf"}}},
+	})
+	require.Len(t, msgs, 1)
+
+	raw, err := json.Marshal(msgs[0])
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	content, ok := decoded["content"].([]any)
+	require.True(t, ok)
+	require.Len(t, content, 1)
+	block, ok := content[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "document", block["type"], "a PDF part must become a document block, not an image block")
+
+	source, ok := block["source"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "application/pdf", source["media_type"])
+	require.Equal(t, "ZmFrZS1wZGY=", source["data"])
+}
+
 // TestToAnthropicMessages_SingleSystemBlockGetsCacheBreakpoint covers the
 // common case (one caller-supplied RoleSystem message): it must still be
 // marked, since it's both first and last.

@@ -291,9 +291,26 @@ func toAnthropicMessages(msgs []llm.Message) ([]anthropic.TextBlockParam, []anth
 					blocks = append(blocks, anthropic.NewTextBlock(m.Content))
 				}
 				for _, p := range m.Parts {
-					if p.ImageBase64 != "" {
-						blocks = append(blocks, anthropic.NewImageBlockBase64(p.MIMEType, p.ImageBase64))
+					if p.ImageBase64 == "" {
+						continue
 					}
+					if p.MIMEType == "application/pdf" {
+						// Claude rejects "application/pdf" from an image
+						// block outright (media_type must be one of
+						// image/jpeg|png|gif|webp) — a PDF needs its own
+						// document block instead. Found in production
+						// (2026-08-27): OCR on a PDF sends this same
+						// ContentPart to Gemini (whose inlineData.mimeType
+						// happily accepts application/pdf) and, on OCR
+						// escalation, to Claude — which then hard-failed
+						// every single time with a 400, making the
+						// escalation path dead code for any PDF input.
+						blocks = append(blocks, anthropic.NewDocumentBlock(anthropic.Base64PDFSourceParam{
+							Data: p.ImageBase64,
+						}))
+						continue
+					}
+					blocks = append(blocks, anthropic.NewImageBlockBase64(p.MIMEType, p.ImageBase64))
 				}
 				// Anthropic requires at least one content block; guard against
 				// a Parts list where every ImageBase64 was empty combined
