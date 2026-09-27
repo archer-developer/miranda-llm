@@ -1,14 +1,17 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/stretchr/testify/require"
@@ -150,21 +153,57 @@ func TestToAnthropicMessages_CachesFirstSystemBlockNotLast(t *testing.T) {
 // gemini_test.go's own — see isRetryable's doc comment for the reasoning
 // this exercises (429/401/403 rotate, 5xx does not).
 
+// overloadedTestErr builds an *anthropic.Error whose Type() reports
+// "overloaded_error" — apierror.Error's errorType field backing Type() is
+// unexported, so a plain struct literal can't set it directly; this goes
+// through the same UnmarshalJSON path richErrorDecoder.newAPIError uses on
+// a real streamed error event, which is the only way to legitimately end up
+// with that state anyway.
+func overloadedTestErr(t *testing.T, statusCode int) *anthropic.Error {
+	t.Helper()
+	err := &anthropic.Error{StatusCode: statusCode}
+	require.NoError(t, err.UnmarshalJSON([]byte(serverErrorBody)))
+	return err
+}
+
 func TestIsRetryable(t *testing.T) {
 	require.True(t, isRetryable(&anthropic.Error{StatusCode: http.StatusTooManyRequests}))
 	require.True(t, isRetryable(&anthropic.Error{StatusCode: http.StatusUnauthorized}))
 	require.True(t, isRetryable(&anthropic.Error{StatusCode: http.StatusForbidden}))
 
-	// 5xx (and Anthropic's own 529 "Overloaded") is deliberately NOT
-	// retryable: every configured key hits the same overloaded backend, so
-	// rotating keys just repeats the identical failure — see isRetryable's
-	// doc comment.
+	// Anthropic's specific "overloaded" shape (error.type ==
+	// "overloaded_error", normally delivered as HTTP 529) IS retryable — a
+	// different, differently-tiered key may not be hitting the same
+	// overloaded capacity pool. errFirstResponseTimeout (attempt's
+	// time-to-first-event watchdog) is treated identically.
+	require.True(t, isRetryable(overloadedTestErr(t, 529)))
+	require.True(t, isRetryable(errFirstResponseTimeout))
+
+	// Any OTHER 5xx (not Anthropic's specific overloaded_error type) is
+	// deliberately still NOT retryable: every configured key hits the same
+	// struggling backend, so rotating keys just repeats the identical
+	// failure — see isRetryable's doc comment.
 	require.False(t, isRetryable(&anthropic.Error{StatusCode: http.StatusInternalServerError}))
 	require.False(t, isRetryable(&anthropic.Error{StatusCode: http.StatusServiceUnavailable}))
 	require.False(t, isRetryable(&anthropic.Error{StatusCode: 529}))
 
 	require.False(t, isRetryable(&anthropic.Error{StatusCode: http.StatusBadRequest}))
 	require.False(t, isRetryable(errors.New("some unrelated network error")))
+}
+
+func TestBanDuration(t *testing.T) {
+	quotaBan := 30 * time.Minute
+	overloadBan := 45 * time.Minute
+
+	require.Equal(t, quotaBan, banDuration(&anthropic.Error{StatusCode: http.StatusTooManyRequests}, quotaBan, overloadBan))
+	require.Equal(t, overloadBan, banDuration(overloadedTestErr(t, 529), quotaBan, overloadBan))
+	require.Equal(t, overloadBan, banDuration(errFirstResponseTimeout, quotaBan, overloadBan))
+
+	// A per-key auth failure is retryable but not banned — the key itself
+	// needs fixing, waiting doesn't help.
+	require.Zero(t, banDuration(&anthropic.Error{StatusCode: http.StatusUnauthorized}, quotaBan, overloadBan))
+	require.Zero(t, banDuration(&anthropic.Error{StatusCode: http.StatusForbidden}, quotaBan, overloadBan))
+	require.Zero(t, banDuration(&anthropic.Error{StatusCode: http.StatusBadRequest}, quotaBan, overloadBan))
 }
 
 // scriptedResponse is one fake server reply, in the order Chat's/
@@ -231,9 +270,14 @@ func anthropicSuccessBody(t *testing.T, text string) string {
 // quotaErrorBody is a 429 rate_limit_error response body.
 const quotaErrorBody = `{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}`
 
-// serverErrorBody is Anthropic's own "overloaded" response body — a 5xx-shaped
-// failure by another name (see isRetryable's doc comment).
+// serverErrorBody is Anthropic's own "overloaded" response body — retryable/
+// bannable, unlike an unrecognized 5xx (see isRetryable's doc comment).
 const serverErrorBody = `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`
+
+// genericServerErrorBody is a 5xx that is NOT Anthropic's specific
+// "overloaded" shape — must still fail immediately without rotating, per
+// the 2026-08-27 incident this behavior is named after.
+const genericServerErrorBody = `{"type":"error","error":{"type":"api_error","message":"internal error"}}`
 
 // badRequestBody is a non-retryable 400 response body.
 const badRequestBody = `{"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}`
@@ -339,14 +383,61 @@ func TestAnthropic_RotatesOnQuotaError(t *testing.T) {
 	require.Equal(t, 2, requestCount(), "exactly one request per key, no needless extra cycling")
 }
 
-// TestAnthropic_ServerErrorFailsImmediatelyWithoutRotating is the Anthropic
-// counterpart to gemini's TestGemini_ServerErrorFailsImmediatelyWithoutRotating
-// — same production incident (2026-08-27), same fix, different provider.
-func TestAnthropic_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+// TestAnthropic_OverloadedRotatesAndBansTheKey is the Anthropic counterpart
+// to gemini's TestGemini_OverloadedRotatesAndBansTheKey: Anthropic's own
+// overloaded_error now rotates to the next configured key and bans the
+// overloaded one on p.bans.
+func TestAnthropic_OverloadedRotatesAndBansTheKey(t *testing.T) {
 	script := []scriptedResponse{
 		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		{body: anthropicSuccessBody(t, "hi from key 2")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.Equal(t, 2, requestCount())
+	require.True(t, p.bans.Banned(0), "the overloaded key must be banned")
+	require.False(t, p.bans.Banned(1))
+}
+
+// TestAnthropic_OverloadedKeyIsSkippedOnNextCall mirrors gemini's
+// TestGemini_OverloadedKeyIsSkippedOnNextCall.
+func TestAnthropic_OverloadedKeyIsSkippedOnNextCall(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		{body: anthropicSuccessBody(t, "first call, key 2")},
+		{body: anthropicSuccessBody(t, "second call, key 2 again")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.Equal(t, 2, requestCount())
+
+	ch2, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi again"}}})
+	require.NoError(t, err)
+	got2 := collect(t, ch2)
+
+	require.Equal(t, "second call, key 2 again", got2.Text)
+	require.Equal(t, 3, requestCount(), "the banned key must be skipped outright, not requested a second time")
+}
+
+// TestAnthropic_GenericServerErrorFailsImmediatelyWithoutRotating is the
+// Anthropic counterpart to gemini's
+// TestGemini_GenericServerErrorFailsImmediatelyWithoutRotating — same
+// production incident (2026-08-27), same fix, different provider: an
+// unrecognized 5xx (not Anthropic's specific overloaded_error type) must
+// still fail on the first key.
+func TestAnthropic_GenericServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusInternalServerError, errBody: genericServerErrorBody},
 		// A second scripted entry that would fail the test via
-		// newTestServer's t.Fatalf if it were ever requested — proof a 5xx
+		// newTestServer's t.Fatalf if it were ever requested — proof this
 		// does not rotate to the next key.
 		{body: anthropicSuccessBody(t, "should never be reached")},
 	}
@@ -357,7 +448,7 @@ func TestAnthropic_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
 	gotErr := collectErr(t, ch)
 
 	require.Error(t, gotErr)
-	require.Equal(t, 1, requestCount(), "a 5xx must not rotate to the next key")
+	require.Equal(t, 1, requestCount(), "an unrecognized 5xx must not rotate to the next key")
 }
 
 func TestAnthropic_NonRetryableErrorFailsImmediately(t *testing.T) {
@@ -390,10 +481,42 @@ func TestAnthropic_RotatesOnAuthError(t *testing.T) {
 	require.Equal(t, 2, requestCount())
 }
 
-func TestAnthropic_AllKeysExhaustedAfterCycles(t *testing.T) {
+// TestAnthropic_AuthFailureLogsDistinctWarning mirrors gemini's
+// TestGemini_AuthFailureLogsDistinctWarning: a 401/403 is never banned (see
+// banDuration) and so will repeat on every future call until a human fixes
+// the key — this asserts that WARN line is distinguishable from the
+// generic "trying next key" one, not just present.
+func TestAnthropic_AuthFailureLogsDistinctWarning(t *testing.T) {
 	script := []scriptedResponse{
-		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
-		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{statusCode: http.StatusUnauthorized, errBody: `{"type":"error","error":{"type":"authentication_error","message":"invalid key"}}`},
+		{body: anthropicSuccessBody(t, "hi from key 2")},
+	}
+	requestCount := newTestServer(t, script)
+
+	t.Setenv("ANTHROPIC_AUTH_LOG_TEST_KEY_0", "fake-key-0")
+	t.Setenv("ANTHROPIC_AUTH_LOG_TEST_KEY_1", "fake-key-1")
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	p, err := New("anthropic-test", "claude-test-model",
+		[]string{"ANTHROPIC_AUTH_LOG_TEST_KEY_0", "ANTHROPIC_AUTH_LOG_TEST_KEY_1"},
+		ToolsConfig{}, RotationConfig{}, logger)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	collect(t, ch)
+	require.Equal(t, 2, requestCount())
+
+	require.Contains(t, buf.String(), "auth failure", "a 401/403 must log a distinct message, not the generic rotation one")
+	require.Contains(t, buf.String(), "manual attention")
+	require.NotContains(t, buf.String(), "key error, trying next key", "the generic rotation message must not ALSO fire for an auth failure")
+}
+
+// TestAnthropic_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle
+// mirrors gemini's TestGemini_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle
+// — see its doc comment for why banning makes the second cycle a no-op here.
+func TestAnthropic_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle(t *testing.T) {
+	script := []scriptedResponse{
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 	}
@@ -404,8 +527,73 @@ func TestAnthropic_AllKeysExhaustedAfterCycles(t *testing.T) {
 	gotErr := collectErr(t, ch)
 
 	require.Error(t, gotErr)
-	require.Contains(t, gotErr.Error(), "exhausted")
-	require.Equal(t, 4, requestCount(), "2 keys x 2 cycles")
+	require.Contains(t, gotErr.Error(), "banned")
+	require.Equal(t, 2, requestCount(), "cycle 2 must find every key already banned and skip straight to failing")
+}
+
+// TestAnthropic_QuotaErrorBansTheKeyForFutureCalls mirrors gemini's
+// TestGemini_QuotaErrorBansTheKeyForFutureCalls.
+func TestAnthropic_QuotaErrorBansTheKeyForFutureCalls(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{body: anthropicSuccessBody(t, "first call, key 2")},
+		{body: anthropicSuccessBody(t, "second call, key 2 again")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.True(t, p.bans.Banned(0))
+
+	ch2, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi again"}}})
+	require.NoError(t, err)
+	got2 := collect(t, ch2)
+
+	require.Equal(t, "second call, key 2 again", got2.Text)
+	require.Equal(t, 3, requestCount())
+}
+
+// TestAnthropic_FirstResponseTimeoutRotatesAndBans mirrors gemini's
+// TestGemini_FirstResponseTimeoutRotatesAndBans: a backend that accepts the
+// connection but never sends a single SSE event within
+// OverloadTimeoutSeconds must be treated as overloaded (ban + rotate).
+func TestAnthropic_FirstResponseTimeoutRotatesAndBans(t *testing.T) {
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		if idx == 0 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(anthropicSuccessBody(t, "hi from key 2")))
+	}))
+	defer ts.Close()
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("ANTHROPIC_TIMEOUT_TEST_KEY_0", "fake-key-0")
+	t.Setenv("ANTHROPIC_TIMEOUT_TEST_KEY_1", "fake-key-1")
+	p, err := New("anthropic-test", "claude-test-model",
+		[]string{"ANTHROPIC_TIMEOUT_TEST_KEY_0", "ANTHROPIC_TIMEOUT_TEST_KEY_1"},
+		ToolsConfig{}, RotationConfig{OverloadTimeoutSeconds: 1}, nil)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.True(t, p.bans.Banned(0), "the slow-to-respond key must be banned")
 }
 
 func TestAnthropic_StructuredRotatesOnQuotaError(t *testing.T) {

@@ -4,9 +4,14 @@
 // streaming, and prompt caching, unlike routing Claude through an
 // OpenAI-compatibility shim. See the gemini package for the sibling adapter
 // this mirrors, including the same api_key_envs-driven key rotation (see
-// keyrotation, isRetryable) — rotates on quota (429) and per-key auth
-// errors (401/403), deliberately NOT on 5xx/529 (Anthropic's "overloaded")
-// server errors.
+// keyrotation, isRetryable) — rotates on quota (429), Anthropic's own
+// "overloaded" error (error.type == "overloaded_error", however it's
+// wrapped — see isOverloaded), a first-response timeout (see attempt), and
+// per-key auth errors (401/403). A quota or overload rotation also bans
+// that key on the shared keyrotation.Banlist for a configurable duration,
+// so a deployment that orders a free-tier key before a paid one fails over
+// on the very next request instead of re-discovering the same failure from
+// scratch — see isRetryable/banDuration.
 package anthropic
 
 import (
@@ -21,6 +26,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/shared"
 
 	llm "github.com/archer-developer/miranda-llm"
 	"github.com/archer-developer/miranda-llm/keyrotation"
@@ -67,11 +73,57 @@ type ToolsConfig struct {
 }
 
 // RotationConfig tunes this package's key-rotation. The zero value falls
-// back to keyrotation's built-in defaults (1 cycle, no cooldown). Mirrors
-// gemini.RotationConfig — same shape, same meaning.
+// back to keyrotation's built-in defaults (1 cycle, no cooldown) plus this
+// package's own ban defaults (30min/30min/10s). Field-for-field identical
+// (same names, types, order) to gemini.RotationConfig/
+// openaicompat.RotationConfig on purpose — see gemini.RotationConfig's doc
+// comment for why.
 type RotationConfig struct {
 	CooldownSeconds int
 	MaxRetryCycles  int
+	// QuotaBanMinutes is how long a key that hit a quota/rate-limit error
+	// (429) is skipped by every subsequent Chat/Structured call, not just
+	// retried within the current one. <= 0 uses defaultQuotaBan.
+	QuotaBanMinutes int
+	// OverloadBanMinutes is the same idea for a key that looks like it hit
+	// Anthropic's own "overloaded" state (see isOverloaded), or timed out
+	// waiting for a first response (see attempt). <= 0 uses
+	// defaultOverloadBan.
+	OverloadBanMinutes int
+	// OverloadTimeoutSeconds bounds how long attempt waits for the FIRST
+	// streamed event before treating the key as overloaded. <= 0 uses
+	// defaultOverloadTimeout.
+	OverloadTimeoutSeconds int
+}
+
+// Built-in ban/timeout defaults applied whenever the corresponding
+// RotationConfig field is <= 0 — mirrors gemini.RotationConfig's own
+// defaults.
+const (
+	defaultQuotaBan        = 30 * time.Minute
+	defaultOverloadBan     = 30 * time.Minute
+	defaultOverloadTimeout = 10 * time.Second
+)
+
+func (r RotationConfig) quotaBan() time.Duration {
+	if r.QuotaBanMinutes <= 0 {
+		return defaultQuotaBan
+	}
+	return time.Duration(r.QuotaBanMinutes) * time.Minute
+}
+
+func (r RotationConfig) overloadBan() time.Duration {
+	if r.OverloadBanMinutes <= 0 {
+		return defaultOverloadBan
+	}
+	return time.Duration(r.OverloadBanMinutes) * time.Minute
+}
+
+func (r RotationConfig) overloadTimeout() time.Duration {
+	if r.OverloadTimeoutSeconds <= 0 {
+		return defaultOverloadTimeout
+	}
+	return time.Duration(r.OverloadTimeoutSeconds) * time.Second
 }
 
 // Provider is an llm.Provider (and llm.StructuredProvider) backed by the
@@ -85,8 +137,12 @@ type Provider struct {
 	clients   []anthropic.Client // one per resolved API key, in configured order
 	tools     ToolsConfig
 	rotation  RotationConfig
-	tracer    llm.Tracer
-	logger    *slog.Logger
+	// bans is shared across every Chat/Structured call this Provider ever
+	// makes (constructed once in New, never per-call) — mirrors
+	// gemini.Provider.bans; see keyrotation.Banlist.
+	bans   *keyrotation.Banlist
+	tracer llm.Tracer
+	logger *slog.Logger
 }
 
 // New builds a Provider named name for the given Claude model, resolving
@@ -137,6 +193,7 @@ func New(name, model string, apiKeyEnvs []string, tools ToolsConfig, rotation Ro
 		clients:   clients,
 		tools:     tools,
 		rotation:  rotation,
+		bans:      keyrotation.NewBanlist(),
 		logger:    logger,
 	}, nil
 }
@@ -187,9 +244,10 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.St
 }
 
 // pump rotates across p.clients (one per configured API key) via
-// keyrotation.Run using isRetryable (quota AND per-key auth failures only —
-// see its doc comment for why 5xx/529 is deliberately excluded), mirroring
-// gemini.Provider.pump.
+// keyrotation.Run, classifying each error via p.classify — quota, overload
+// (Anthropic's own overloaded_error, or a first-response timeout), and
+// per-key auth failures all rotate to the next key; quota/overload also ban
+// that key on p.bans for future calls — mirrors gemini.Provider.pump.
 func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, out chan<- llm.StreamChunk) {
 	defer close(out)
 
@@ -197,7 +255,7 @@ func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, 
 		Cycles:   p.rotation.MaxRetryCycles,
 		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
-	err := keyrotation.Run(ctx, p.logger, "anthropic", len(p.clients), rotCfg, isRetryable,
+	err := keyrotation.Run(ctx, p.logger, "anthropic", len(p.clients), rotCfg, p.bans, p.classify,
 		func(ctx context.Context, i int) error {
 			return p.attempt(ctx, i, params, out)
 		},
@@ -221,6 +279,12 @@ func (p *Provider) pump(ctx context.Context, params anthropic.MessageNewParams, 
 // sentinel of the same name.
 var errAttemptWritten = errors.New("anthropic: attempt already wrote its terminal error")
 
+// errFirstResponseTimeout means attempt gave up waiting for the first
+// streamed event within RotationConfig.OverloadTimeoutSeconds, before
+// anything was forwarded to the caller — mirrors gemini's sentinel of the
+// same name/reasoning.
+var errFirstResponseTimeout = errors.New("anthropic: no response within first-response timeout")
+
 // attempt makes exactly one Messages.NewStreaming call against one client
 // (one API key), forwarding TextDelta chunks to out live as they stream in
 // and using the SDK's built-in Message.Accumulate to reconstruct the full
@@ -243,19 +307,58 @@ var errAttemptWritten = errors.New("anthropic: attempt already wrote its termina
 // Done to out). Returns errAttemptWritten in the two cases described above
 // (forwarded-then-error, or a non-retryable error) — both already wrote
 // their own Err chunk to out, so keyrotation.Run/pump must not retry or
-// double-report. Returns the raw streamErr only when nothing has been
-// forwarded yet AND isRetryable(streamErr) is true, so keyrotation.Run's
-// own isRetryable check agrees and tries the next key.
+// double-report. Returns the raw streamErr (or errFirstResponseTimeout —
+// see below) only when nothing has been forwarded yet AND isRetryable of it
+// is true, so keyrotation.Run's own classify check agrees and tries the
+// next key.
+//
+// Before anything is forwarded, attempt also bounds how long it waits for
+// the very FIRST event via RotationConfig.OverloadTimeoutSeconds — mirrors
+// gemini.Provider.attempt's own first-response watchdog; see its doc
+// comment for the full reasoning (only the first event, never a later one,
+// since the forwarded-then-error rule above already forbids retrying past
+// that point anyway).
 func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.MessageNewParams, out chan<- llm.StreamChunk) error {
+	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+
 	// NewStreaming performs the actual HTTP request eagerly (before this
 	// call returns), so a 429/401/403/5xx from the initial request surfaces
 	// via stream.Err() below exactly like a mid-stream error would — there
 	// is no separate "did the request even go out" error to check first.
-	stream := p.clients[keyIndex].Messages.NewStreaming(ctx, params)
+	stream := p.clients[keyIndex].Messages.NewStreaming(attemptCtx, params)
 
 	var message anthropic.Message
 	forwarded := false
-	for stream.Next() {
+
+	first := true
+	for {
+		var hasNext bool
+		if first {
+			first = false
+			var abandoned bool
+			hasNext, abandoned = keyrotation.FirstStepTimeout(ctx, p.rotation.overloadTimeout(), stream.Next)
+			if abandoned {
+				// stream.Next() may still be running on the goroutine
+				// FirstStepTimeout spawned — cancelling attemptCtx unblocks
+				// it promptly, but this attempt must not touch stream
+				// again (Current/Err/a second Next call) without waiting
+				// for that goroutine first, which it never does: it just
+				// returns, leaving the abandoned call to finish and be
+				// garbage collected on its own.
+				cancelAttempt()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				p.logger.Warn("anthropic: no response within first-response timeout, treating key as overloaded", "provider", p.name, "key_index", keyIndex, "timeout", p.rotation.overloadTimeout())
+				return errFirstResponseTimeout
+			}
+		} else {
+			hasNext = stream.Next()
+		}
+		if !hasNext {
+			break
+		}
 		event := stream.Current()
 		if err := message.Accumulate(event); err != nil {
 			wrapped := fmt.Errorf("anthropic: accumulate: %w", err)
@@ -278,7 +381,7 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.M
 			return errAttemptWritten
 		}
 		if isRetryable(streamErr) {
-			p.logger.Warn("anthropic: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", streamErr)
+			p.logKeyRotate(keyIndex, streamErr)
 			return streamErr
 		}
 		p.logger.Error("anthropic: request failed", "provider", p.name, "key_index", keyIndex, "error", streamErr)
@@ -299,22 +402,78 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.M
 	return nil
 }
 
+// isOverloaded reports whether err is Anthropic's specific "overloaded"
+// shape — error.type == "overloaded_error" in the response body (normally
+// delivered as HTTP 529, a non-standard code, but Type() is checked instead
+// of StatusCode since it's the documented, semantic signal — see
+// apierror.Error.Type's doc comment). Only this specific shape is treated
+// as retryable/bannable; see isRetryable's doc comment for why a bare 5xx
+// otherwise still fails immediately.
+func isOverloaded(err error) bool {
+	var apiErr *anthropic.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Type() == shared.ErrorTypeOverloadedError
+}
+
+// isAuthFailure reports whether err is a per-key auth failure (HTTP 401
+// Unauthorized / 403 Forbidden) — a revoked, disabled, or otherwise invalid
+// key. Used only to pick a more pointed log message (see logKeyRotate):
+// unlike quota/overload, this condition never clears on its own, so it is
+// deliberately never banned (see banDuration) — a fixed-duration ban would
+// just delay, not fix, the same failure repeating on every future call.
+func isAuthFailure(err error) bool {
+	var apiErr *anthropic.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden
+}
+
+// logKeyRotate logs the WARN for a retryable per-attempt error right before
+// keyrotation.Run moves on to the next key — mirrors gemini.Provider's own.
+// An auth failure gets a distinct, more pointed message: unlike quota/
+// overload (banned — see banDuration), an invalid/revoked key stays
+// invalid and will be retried and fail again on EVERY future call until a
+// human fixes or removes it from api_key_envs.
+func (p *Provider) logKeyRotate(keyIndex int, err error) {
+	if isAuthFailure(err) {
+		p.logger.Warn("anthropic: key auth failure (401/403) — key looks invalid or revoked and needs manual attention; not banned, so it will be retried again on every future call until fixed", "provider", p.name, "key_index", keyIndex, "error", err)
+		return
+	}
+	p.logger.Warn("anthropic: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", err)
+}
+
 // isRetryable reports whether err is worth rotating to the next key for —
 // mirrors gemini.isRetryable's reasoning exactly, just against Anthropic's
 // own error shape (*anthropic.Error, an alias for the SDK's internal
-// apierror.Error, carrying StatusCode):
+// apierror.Error, carrying StatusCode and Type()):
 //   - a quota/rate-limit error (HTTP 429) — quota is tracked per key, so a
 //     different configured key plausibly has budget left.
+//   - Anthropic's own "overloaded" shape (see isOverloaded) or
+//     errFirstResponseTimeout — a different key (especially a
+//     differently-tiered one) may not be hitting the same overloaded
+//     capacity pool. This used to be excluded entirely (see the
+//     production-incident note below) — it's back specifically for this
+//     shape, gated by keyrotation.Banlist: an overloaded key gets banned
+//     for RotationConfig.OverloadBanMinutes when it happens, so a run of
+//     several configured keys all hitting the same genuine outage still
+//     only pays the multiplied latency once, not on every subsequent
+//     request until the outage clears.
 //   - a per-key auth failure (HTTP 401 Unauthorized / 403 Forbidden) — a
 //     property of THAT key specifically, not of the request.
 //
-// A server-side error (HTTP 5xx, or Anthropic's own 529 "Overloaded" —
-// functionally a 5xx, just a non-standard code) is deliberately NOT
-// retried: the backend itself is struggling, so every configured key hits
-// the same wall and cycling through them just repeats the identical
-// failure — see gemini.isRetryable's doc comment for the production
-// incident (2026-08-27) this reasoning is shared with.
+// Any OTHER server-side error (a bare 5xx that isn't Anthropic's specific
+// overloaded_error shape) is deliberately still NOT retried: the backend
+// itself is struggling, so every configured key hits the same wall and
+// cycling through them just repeats the identical failure — see
+// gemini.isRetryable's doc comment for the production incident
+// (2026-08-27) this reasoning is shared with.
 func isRetryable(err error) bool {
+	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+		return true
+	}
 	var apiErr *anthropic.Error
 	if !errors.As(err, &apiErr) {
 		return false
@@ -324,6 +483,27 @@ func isRetryable(err error) bool {
 		return true
 	}
 	return false
+}
+
+// banDuration reports how long to ban the key that produced err on the
+// shared keyrotation.Banlist — 0 means "retry, but don't ban" (a per-key
+// auth failure is retryable but isn't a transient condition a timed ban
+// would help with).
+func banDuration(err error, quotaBan, overloadBan time.Duration) time.Duration {
+	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+		return overloadBan
+	}
+	var apiErr *anthropic.Error
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests {
+		return quotaBan
+	}
+	return 0
+}
+
+// classify adapts isRetryable/banDuration to keyrotation.Run's classify
+// shape, supplying this Provider's configured ban durations.
+func (p *Provider) classify(err error) (retryable bool, ban time.Duration) {
+	return isRetryable(err), banDuration(err, p.rotation.quotaBan(), p.rotation.overloadBan())
 }
 
 // Structured implements llm.StructuredProvider. The Messages API has no
@@ -386,20 +566,23 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 	}
 
 	// Rotates across configured API keys exactly like Chat's pump/attempt,
-	// via the same keyrotation.Run + isRetryable — one non-streaming call
-	// per attempted key (Messages.New), since a forced single tool call has
-	// no meaningful streaming granularity to forward.
+	// via the same keyrotation.Run + p.classify (sharing the same p.bans) —
+	// one non-streaming call per attempted key (Messages.New), since a
+	// forced single tool call has no meaningful streaming granularity to
+	// forward, and no first-response-timeout check for the same reason
+	// Structured skips it in gemini: the request either returns within ctx
+	// or it doesn't.
 	var result json.RawMessage
 	rotCfg := keyrotation.Config{
 		Cycles:   p.rotation.MaxRetryCycles,
 		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
-	err := keyrotation.Run(ctx, p.logger, "anthropic-structured", len(p.clients), rotCfg, isRetryable,
+	err := keyrotation.Run(ctx, p.logger, "anthropic-structured", len(p.clients), rotCfg, p.bans, p.classify,
 		func(ctx context.Context, keyIndex int) error {
 			message, err := p.clients[keyIndex].Messages.New(ctx, params)
 			if err != nil {
 				if isRetryable(err) {
-					p.logger.Warn("anthropic: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", err)
+					p.logKeyRotate(keyIndex, err)
 				} else {
 					p.logger.Error("anthropic: request failed", "provider", p.name, "key_index", keyIndex, "error", err)
 				}

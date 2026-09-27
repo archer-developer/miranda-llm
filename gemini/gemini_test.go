@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genai"
@@ -23,14 +24,38 @@ func TestIsRetryable(t *testing.T) {
 	require.True(t, isRetryable(genai.APIError{Code: http.StatusForbidden}))
 	require.True(t, isRetryable(genai.APIError{Status: "RESOURCE_EXHAUSTED"}))
 
-	// 5xx is deliberately NOT retryable: every configured key hits the same
-	// overloaded backend, so rotating keys just repeats the identical
-	// failure instead of helping — see isRetryable's doc comment.
+	// Gemini's specific "overloaded" shape (503 UNAVAILABLE) IS retryable —
+	// a different, differently-tiered key may not be hitting the same
+	// overloaded capacity pool. errFirstResponseTimeout (attempt's
+	// time-to-first-event watchdog) is treated identically.
+	require.True(t, isRetryable(genai.APIError{Code: http.StatusServiceUnavailable, Status: "UNAVAILABLE"}))
+	require.True(t, isRetryable(errFirstResponseTimeout))
+
+	// Any OTHER 5xx (not Gemini's specific overload shape) is deliberately
+	// still NOT retryable: every configured key hits the same struggling
+	// backend, so rotating keys just repeats the identical failure instead
+	// of helping — see isRetryable's doc comment.
 	require.False(t, isRetryable(genai.APIError{Code: http.StatusInternalServerError}))
 	require.False(t, isRetryable(genai.APIError{Code: http.StatusServiceUnavailable}))
 
 	require.False(t, isRetryable(genai.APIError{Code: http.StatusBadRequest}))
 	require.False(t, isRetryable(errors.New("some unrelated network error")))
+}
+
+func TestBanDuration(t *testing.T) {
+	quotaBan := 30 * time.Minute
+	overloadBan := 45 * time.Minute
+
+	require.Equal(t, quotaBan, banDuration(genai.APIError{Code: http.StatusTooManyRequests}, quotaBan, overloadBan))
+	require.Equal(t, quotaBan, banDuration(genai.APIError{Status: "RESOURCE_EXHAUSTED"}, quotaBan, overloadBan))
+	require.Equal(t, overloadBan, banDuration(genai.APIError{Code: http.StatusServiceUnavailable, Status: "UNAVAILABLE"}, quotaBan, overloadBan))
+	require.Equal(t, overloadBan, banDuration(errFirstResponseTimeout, quotaBan, overloadBan))
+
+	// A per-key auth failure is retryable but not banned — the key itself
+	// needs fixing, waiting doesn't help.
+	require.Zero(t, banDuration(genai.APIError{Code: http.StatusUnauthorized}, quotaBan, overloadBan))
+	require.Zero(t, banDuration(genai.APIError{Code: http.StatusForbidden}, quotaBan, overloadBan))
+	require.Zero(t, banDuration(genai.APIError{Code: http.StatusBadRequest}, quotaBan, overloadBan))
 }
 
 func TestToLLMToolCall_SynthesizesIDWhenMissing(t *testing.T) {
@@ -244,8 +269,14 @@ func midStreamErrorEvent(t *testing.T, code int, status, message string) string 
 // quotaErrorBody is a Gemini generateContent 429 response body.
 const quotaErrorBody = `{"error":{"code":429,"message":"quota exceeded","status":"RESOURCE_EXHAUSTED"}}`
 
-// serverErrorBody is a generic Gemini 5xx response body.
+// serverErrorBody is Gemini's specific "overloaded" 503 response body
+// (status UNAVAILABLE) — retryable/bannable, unlike an unrecognized 5xx.
 const serverErrorBody = `{"error":{"code":503,"message":"backend overloaded","status":"UNAVAILABLE"}}`
+
+// genericServerErrorBody is a 5xx that is NOT Gemini's specific "overloaded"
+// shape (no status:"UNAVAILABLE") — must still fail immediately without
+// rotating, per the 2026-08-27 incident this behavior is named after.
+const genericServerErrorBody = `{"error":{"code":500,"message":"internal error","status":"INTERNAL"}}`
 
 // badRequestBody is a non-retryable Gemini 400 response body.
 const badRequestBody = `{"error":{"code":400,"message":"invalid argument","status":"INVALID_ARGUMENT"}}`
@@ -370,19 +401,68 @@ func TestGemini_RotatesOnQuotaError(t *testing.T) {
 	require.Equal(t, 2, requestCount(), "exactly one request per key, no needless extra cycling")
 }
 
-// TestGemini_ServerErrorFailsImmediatelyWithoutRotating reproduces a
-// production incident (2026-08-27): a plain 503 ("high demand") during OCR
-// rotated through all 4 configured keys, getting the identical 503 from
-// each one before finally failing — since the backend itself is
-// overloaded, every key hits the same wall, so rotating just multiplies the
-// latency of a failure that was never going to succeed on any key. A 5xx
-// must fail on the first key so the caller's own cross-provider escalation
-// (e.g. extraction.ocrWithEscalation) kicks in promptly instead.
-func TestGemini_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+// TestGemini_OverloadedRotatesAndBansTheKey covers the overload/free-vs-paid
+// key scenario: Gemini's specific "backend overloaded" shape (503
+// UNAVAILABLE) now rotates to the next configured key, and bans the
+// overloaded one on p.bans so a later call skips straight to the other key
+// — see TestGemini_OverloadedKeyIsSkippedOnNextCall for that half.
+func TestGemini_OverloadedRotatesAndBansTheKey(t *testing.T) {
 	script := []scriptedResponse{
 		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		{events: []string{textEvent(t, "hi from key 2")}},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.Equal(t, 2, requestCount())
+	require.True(t, p.bans.Banned(0), "the overloaded key must be banned")
+	require.False(t, p.bans.Banned(1), "the key that actually served the response must not be banned")
+}
+
+// TestGemini_OverloadedKeyIsSkippedOnNextCall is the point of banning at
+// all: once key 0 has been seen overloaded, a brand-new Chat call (a
+// separate request, sharing the same Provider/Banlist) must go straight to
+// key 1 without even trying key 0 again.
+func TestGemini_OverloadedKeyIsSkippedOnNextCall(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		{events: []string{textEvent(t, "first call, key 2")}},
+		{events: []string{textEvent(t, "second call, key 2 again")}},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.Equal(t, 2, requestCount())
+
+	ch2, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi again"}}})
+	require.NoError(t, err)
+	got2 := collect(t, ch2)
+
+	require.Equal(t, "second call, key 2 again", got2.Text)
+	require.Equal(t, 3, requestCount(), "the banned key must be skipped outright, not requested a second time")
+}
+
+// TestGemini_GenericServerErrorFailsImmediatelyWithoutRotating reproduces a
+// production incident (2026-08-27): a plain 5xx ("high demand") during OCR
+// rotated through all 4 configured keys, getting the identical error from
+// each one before finally failing — since the backend itself is
+// struggling, every key hits the same wall, so rotating just multiplies the
+// latency of a failure that was never going to succeed on any key. Unlike
+// Gemini's specific "overloaded" shape (503 UNAVAILABLE — see
+// TestGemini_OverloadedRotatesAndBansTheKey), an unrecognized 5xx must still
+// fail on the first key so the caller's own cross-provider escalation (e.g.
+// extraction.ocrWithEscalation) kicks in promptly instead.
+func TestGemini_GenericServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusInternalServerError, errBody: genericServerErrorBody},
 		// A second scripted entry that would fail the test via
-		// newTestServer's t.Fatalf if it were ever requested — proof a 5xx
+		// newTestServer's t.Fatalf if it were ever requested — proof this
 		// does not rotate to the next key.
 		{events: []string{textEvent(t, "should never be reached")}},
 	}
@@ -393,7 +473,7 @@ func TestGemini_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
 	gotErr := collectErr(t, ch)
 
 	require.Error(t, gotErr)
-	require.Equal(t, 1, requestCount(), "a 5xx must not rotate to the next key")
+	require.Equal(t, 1, requestCount(), "an unrecognized 5xx must not rotate to the next key")
 }
 
 func TestGemini_NonRetryableErrorFailsImmediately(t *testing.T) {
@@ -414,10 +494,17 @@ func TestGemini_NonRetryableErrorFailsImmediately(t *testing.T) {
 	require.Equal(t, 1, requestCount(), "a non-retryable error must not rotate to the next key")
 }
 
-func TestGemini_AllKeysExhaustedAfterCycles(t *testing.T) {
+// TestGemini_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle covers
+// how banning interacts with the older Cycles/Cooldown retry loop: once
+// both keys hit quota in cycle 1, both are banned (30min default, far
+// longer than any Cooldown), so cycle 2 finds every key banned and fails
+// immediately per keyrotation.Run's own "all banned" short-circuit — it
+// does NOT spend a second cycle re-requesting keys that are already known
+// to be out of budget. Recovery now comes from the ban's own expiry (or a
+// caller's cross-provider escalation), not from waiting out a cooldown
+// inside this one request.
+func TestGemini_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle(t *testing.T) {
 	script := []scriptedResponse{
-		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
-		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 	}
@@ -428,8 +515,80 @@ func TestGemini_AllKeysExhaustedAfterCycles(t *testing.T) {
 	gotErr := collectErr(t, ch)
 
 	require.Error(t, gotErr)
-	require.Contains(t, gotErr.Error(), "exhausted")
-	require.Equal(t, 4, requestCount(), "2 keys x 2 cycles")
+	require.Contains(t, gotErr.Error(), "banned")
+	require.Equal(t, 2, requestCount(), "cycle 2 must find every key already banned and skip straight to failing, not re-request either key")
+}
+
+// TestGemini_QuotaErrorBansTheKeyForFutureCalls mirrors
+// TestGemini_OverloadedKeyIsSkippedOnNextCall for the quota case: a 429
+// bans the key so a later, separate Chat call skips it outright.
+func TestGemini_QuotaErrorBansTheKeyForFutureCalls(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{events: []string{textEvent(t, "first call, key 2")}},
+		{events: []string{textEvent(t, "second call, key 2 again")}},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.True(t, p.bans.Banned(0))
+
+	ch2, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi again"}}})
+	require.NoError(t, err)
+	got2 := collect(t, ch2)
+
+	require.Equal(t, "second call, key 2 again", got2.Text)
+	require.Equal(t, 3, requestCount())
+}
+
+// TestGemini_FirstResponseTimeoutRotatesAndBans is the regression test for
+// the time-based half of overload detection: a backend that accepts the
+// connection but never sends a single SSE event within
+// OverloadTimeoutSeconds looks, to a caller, just like one that eventually
+// answers 503 — attempt must give up waiting, treat it as overloaded (ban +
+// rotate), and the slow key must never get to forward anything (the server
+// never sends its event at all in this test, so there's nothing for a real
+// implementation bug to accidentally forward).
+func TestGemini_FirstResponseTimeoutRotatesAndBans(t *testing.T) {
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		if idx == 0 {
+			// Accept the connection, send headers, then hang — never write
+			// a single SSE event — until the client gives up.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(textEvent(t, "hi from key 2")))
+	}))
+	defer ts.Close()
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("GEMINI_TIMEOUT_TEST_KEY_A", "fake-key-a")
+	t.Setenv("GEMINI_TIMEOUT_TEST_KEY_B", "fake-key-b")
+	p, err := New(context.Background(), "gemini-test", "gemini-test-model",
+		[]string{"GEMINI_TIMEOUT_TEST_KEY_A", "GEMINI_TIMEOUT_TEST_KEY_B"},
+		ToolsConfig{}, RotationConfig{OverloadTimeoutSeconds: 1}, nil)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.True(t, p.bans.Banned(0), "the slow-to-respond key must be banned")
 }
 
 // TestGemini_RotationEmitsNoChunksFromFailedAttempt confirms rotation still
@@ -644,6 +803,37 @@ func TestGemini_RotatesOnAuthError(t *testing.T) {
 
 	require.Equal(t, "hi from key 2", got.Text)
 	require.Equal(t, 2, requestCount())
+}
+
+// TestGemini_AuthFailureLogsDistinctWarning covers logKeyRotate: unlike a
+// routine quota/overload rotation, a 401/403 is never banned (see
+// banDuration) and so will repeat on every future call until a human fixes
+// the key — this asserts that WARN line is distinguishable from the
+// generic "trying next key" one, not just present.
+func TestGemini_AuthFailureLogsDistinctWarning(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusUnauthorized, errBody: authErrorBody},
+		{events: []string{textEvent(t, "hi from key 2")}},
+	}
+	requestCount := newTestServer(t, script)
+
+	t.Setenv("GEMINI_AUTH_LOG_TEST_KEY_A", "fake-key-a")
+	t.Setenv("GEMINI_AUTH_LOG_TEST_KEY_B", "fake-key-b")
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	p, err := New(context.Background(), "gemini-test", "gemini-test-model",
+		[]string{"GEMINI_AUTH_LOG_TEST_KEY_A", "GEMINI_AUTH_LOG_TEST_KEY_B"},
+		ToolsConfig{}, RotationConfig{}, logger)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	collect(t, ch)
+	require.Equal(t, 2, requestCount())
+
+	require.Contains(t, buf.String(), "auth failure", "a 401/403 must log a distinct message, not the generic rotation one")
+	require.Contains(t, buf.String(), "manual attention")
+	require.NotContains(t, buf.String(), "key error, trying next key", "the generic rotation message must not ALSO fire for an auth failure")
 }
 
 func TestGemini_RotatesOnForbiddenError(t *testing.T) {

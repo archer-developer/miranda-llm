@@ -6,8 +6,13 @@
 // not wired — see nativeTools's doc comment, it's Vertex AI-only on the
 // generateContent API this package calls). See the anthropic package for
 // the sibling adapter this mirrors, and keyrotation for the API-key-rotation
-// shape this uses — rotates on quota (429) and per-key auth errors
-// (401/403), deliberately NOT on 5xx server errors — see isRetryable.
+// shape this uses — rotates on quota (429), an overloaded backend (503
+// UNAVAILABLE, or a first-response timeout — see attempt), and per-key auth
+// errors (401/403); a quota or overload rotation also bans that key on the
+// shared keyrotation.Banlist for a configurable duration, so a deployment
+// that orders a free-tier key before a paid one fails over on the very next
+// request instead of re-discovering the same failure from scratch — see
+// isRetryable/banDuration.
 package gemini
 
 import (
@@ -16,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"net/http"
 	"os"
@@ -78,10 +84,65 @@ type ToolsConfig struct {
 }
 
 // RotationConfig tunes this package's key-rotation. The zero value falls
-// back to keyrotation's built-in defaults (1 cycle, no cooldown).
+// back to keyrotation's built-in defaults (1 cycle, no cooldown) plus this
+// package's own ban defaults (30min/30min/10s — see
+// defaultQuotaBan/defaultOverloadBan/defaultOverloadTimeout).
+//
+// Field-for-field identical (same names, types, order) to
+// anthropic.RotationConfig and openaicompat.RotationConfig on purpose:
+// cmd/miranda's main.go converts one shared config.GeminiRotationConfig
+// directly into whichever of these three a provider entry needs via a bare
+// Go struct conversion, which only compiles if all four shapes match
+// exactly.
 type RotationConfig struct {
 	CooldownSeconds int
 	MaxRetryCycles  int
+	// QuotaBanMinutes is how long a key that hit a quota/rate-limit error
+	// (429, or RESOURCE_EXHAUSTED) is skipped by every subsequent Chat/
+	// Structured call, not just retried within the current one. <= 0 uses
+	// defaultQuotaBan.
+	QuotaBanMinutes int
+	// OverloadBanMinutes is the same idea for a key that looks like it hit
+	// an overloaded backend (503 UNAVAILABLE, or a first-response timeout —
+	// see attempt). <= 0 uses defaultOverloadBan.
+	OverloadBanMinutes int
+	// OverloadTimeoutSeconds bounds how long attempt waits for the FIRST
+	// streamed event before treating the key as overloaded — see attempt's
+	// doc comment for why this is safe only before anything forwards. <= 0
+	// uses defaultOverloadTimeout.
+	OverloadTimeoutSeconds int
+}
+
+// Built-in ban/timeout defaults applied whenever the corresponding
+// RotationConfig field is <= 0 — mirrors RotationConfig's own doc comment
+// ("zero value falls back to built-in defaults") for the two fields that
+// already worked this way (CooldownSeconds/MaxRetryCycles, defaulted inside
+// keyrotation.Run itself).
+const (
+	defaultQuotaBan        = 30 * time.Minute
+	defaultOverloadBan     = 30 * time.Minute
+	defaultOverloadTimeout = 10 * time.Second
+)
+
+func (r RotationConfig) quotaBan() time.Duration {
+	if r.QuotaBanMinutes <= 0 {
+		return defaultQuotaBan
+	}
+	return time.Duration(r.QuotaBanMinutes) * time.Minute
+}
+
+func (r RotationConfig) overloadBan() time.Duration {
+	if r.OverloadBanMinutes <= 0 {
+		return defaultOverloadBan
+	}
+	return time.Duration(r.OverloadBanMinutes) * time.Minute
+}
+
+func (r RotationConfig) overloadTimeout() time.Duration {
+	if r.OverloadTimeoutSeconds <= 0 {
+		return defaultOverloadTimeout
+	}
+	return time.Duration(r.OverloadTimeoutSeconds) * time.Second
 }
 
 // Provider is an llm.Provider (and llm.StructuredProvider) backed by the
@@ -94,8 +155,13 @@ type Provider struct {
 	clients  []*genai.Client // one per resolved API key, in configured order
 	tools    ToolsConfig
 	rotation RotationConfig
-	tracer   llm.Tracer
-	logger   *slog.Logger
+	// bans is shared across every Chat/Structured call this Provider ever
+	// makes (constructed once in New, never per-call) — that's what lets a
+	// key exhausted or found overloaded on one request be skipped by the
+	// very next one. See keyrotation.Banlist.
+	bans   *keyrotation.Banlist
+	tracer llm.Tracer
+	logger *slog.Logger
 }
 
 // New builds a Provider named name for the given Gemini model, resolving
@@ -147,6 +213,7 @@ func New(ctx context.Context, name, model string, apiKeyEnvs []string, tools Too
 		clients:  clients,
 		tools:    tools,
 		rotation: rotation,
+		bans:     keyrotation.NewBanlist(),
 		logger:   logger,
 	}, nil
 }
@@ -176,8 +243,10 @@ func (p *Provider) Chat(ctx context.Context, req llm.ChatRequest) (<-chan llm.St
 }
 
 // pump rotates across p.clients (one per configured API key) via
-// keyrotation.Run using isRetryable (quota AND per-key auth failures only —
-// see its doc comment for why 5xx is deliberately excluded).
+// keyrotation.Run, classifying each error via p.classify — quota, overload
+// (503/UNAVAILABLE, or a first-response timeout), and per-key auth failures
+// all rotate to the next key; quota/overload also ban that key on p.bans
+// for future calls (see RotationConfig/classify).
 func (p *Provider) pump(ctx context.Context, contents []*genai.Content, cfg *genai.GenerateContentConfig, out chan<- llm.StreamChunk) {
 	defer close(out)
 
@@ -185,7 +254,7 @@ func (p *Provider) pump(ctx context.Context, contents []*genai.Content, cfg *gen
 		Cycles:   p.rotation.MaxRetryCycles,
 		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
-	err := keyrotation.Run(ctx, p.logger, "gemini", len(p.clients), rotCfg, isRetryable,
+	err := keyrotation.Run(ctx, p.logger, "gemini", len(p.clients), rotCfg, p.bans, p.classify,
 		func(ctx context.Context, i int) error {
 			return p.attempt(ctx, p.clients[i], i, contents, cfg, out)
 		},
@@ -209,6 +278,16 @@ func (p *Provider) pump(ctx context.Context, contents []*genai.Content, cfg *gen
 // rotating and returns it straight back to pump.
 var errAttemptWritten = errors.New("gemini: attempt already wrote its terminal error")
 
+// errFirstResponseTimeout means attempt gave up waiting for Gemini's first
+// streamed event within RotationConfig.OverloadTimeoutSeconds, before
+// anything was forwarded to the caller. isRetryable treats it exactly like
+// a 503/UNAVAILABLE — rotate to the next key — and banDuration bans the key
+// for OverloadBanMinutes, since a backend that hasn't produced a single
+// event within the configured threshold looks the same, from a caller's
+// perspective, as one that answered 503 outright; the only difference is
+// Gemini never got around to sending the error.
+var errFirstResponseTimeout = errors.New("gemini: no response within first-response timeout")
+
 // attempt makes exactly one GenerateContentStream call against one client
 // (one API key), forwarding TextDelta/ToolCall chunks to out live as they
 // stream in — unlike a fully-buffered design, the first output can reach
@@ -229,10 +308,24 @@ var errAttemptWritten = errors.New("gemini: attempt already wrote its terminal e
 // Done to out). Returns errAttemptWritten in the two cases described above
 // (forwarded-then-error, or a non-retryable error from the first event) —
 // both already wrote their own Err chunk to out, so keyrotation.Run/pump
-// must not retry or double-report. Returns the raw streamErr only when
-// nothing has been forwarded yet AND isRetryable(streamErr) is true, so
-// keyrotation.Run's own isRetryable check (the same package-level
-// function, applied to the same value) agrees and tries the next key.
+// must not retry or double-report. Returns the raw streamErr (or
+// errFirstResponseTimeout — see below) only when nothing has been forwarded
+// yet AND isRetryable of it is true, so keyrotation.Run's own classify
+// check (applied to the same value) agrees and tries the next key.
+//
+// Before anything is forwarded, attempt also bounds how long it waits for
+// the very FIRST event via RotationConfig.OverloadTimeoutSeconds
+// (p.rotation.overloadTimeout()) — a backend that hasn't produced a single
+// byte within that window looks, from the caller's perspective, exactly
+// like one that would eventually 503 UNAVAILABLE, just slower about it. The
+// underlying request is pulled through iter.Pull2 (rather than a plain
+// range) specifically so this first step can be raced against a timer via
+// keyrotation.FirstStepTimeout: canceling attemptCtx on timeout aborts the
+// real HTTP call so its goroutine doesn't leak past the real network
+// timeout. This check only ever applies to the first event — once anything
+// has streamed, a slow SUBSEQUENT event just means a long response, not an
+// overloaded backend, and the forwarded-then-error rule above already
+// forbids retrying past that point anyway.
 func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex int, contents []*genai.Content, cfg *genai.GenerateContentConfig, out chan<- llm.StreamChunk) error {
 	start := time.Now()
 	var textBuf strings.Builder // accumulated only for tracing, not for forwarding
@@ -243,7 +336,60 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 	var promptFeedback *genai.GenerateContentResponsePromptFeedback
 	forwarded := false
 
-	for resp, streamErr := range client.Models.GenerateContentStream(ctx, p.model, contents, cfg) {
+	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+
+	next, stop := iter.Pull2(client.Models.GenerateContentStream(attemptCtx, p.model, contents, cfg))
+
+	// The first pull happens on a background goroutine, raced against
+	// p.rotation.overloadTimeout(), so a backend that never sends a single
+	// event within the threshold can be treated as overloaded instead of
+	// hanging attempt indefinitely. Everything after the first pull calls
+	// next directly (synchronously, in this same goroutine), which is the
+	// only usage iter.Pull2 supports concurrently with its own stop — so on
+	// the timeout/ctx-cancellation path below, stop must NOT be called
+	// until this abandoned goroutine's next() call actually returns
+	// (attemptCtx is cancelled first, so the underlying stream unblocks
+	// promptly); calling stop while a next() call is still in flight
+	// elsewhere is a data race in iter.Pull2's own bookkeeping, not just a
+	// logic bug — found via `go test -race` while developing this.
+	type firstStep struct {
+		resp *genai.GenerateContentResponse
+		err  error
+		more bool
+	}
+	firstCh := make(chan firstStep, 1)
+	go func() {
+		r, e, m := next()
+		firstCh <- firstStep{r, e, m}
+	}()
+
+	var resp *genai.GenerateContentResponse
+	var streamErr error
+	var more bool
+	select {
+	case s := <-firstCh:
+		resp, streamErr, more = s.resp, s.err, s.more
+	case <-time.After(p.rotation.overloadTimeout()):
+		cancelAttempt()
+		go func() { <-firstCh; stop() }()
+		p.logger.Warn("gemini: no response within first-response timeout, treating key as overloaded", "provider", p.name, "key_index", keyIndex, "timeout", p.rotation.overloadTimeout())
+		return errFirstResponseTimeout
+	case <-ctx.Done():
+		go func() { <-firstCh; stop() }()
+		return ctx.Err()
+	}
+	defer stop()
+
+	first := true
+	for {
+		if !first {
+			resp, streamErr, more = next()
+		}
+		first = false
+		if !more {
+			break
+		}
 		if streamErr != nil {
 			if forwarded {
 				p.logger.Error("gemini: request failed mid-stream after partial output, not retrying", "provider", p.name, "key_index", keyIndex, "error", streamErr)
@@ -253,7 +399,7 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 				return errAttemptWritten
 			}
 			if isRetryable(streamErr) {
-				p.logger.Warn("gemini: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", streamErr)
+				p.logKeyRotate(keyIndex, streamErr)
 				return streamErr
 			}
 			p.logger.Error("gemini: request failed", "provider", p.name, "key_index", keyIndex, "error", streamErr)
@@ -358,7 +504,10 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 // pattern buildTools already uses for function declarations via
 // ParametersJsonSchema) with a single, non-streaming GenerateContent call.
 // Rotates across configured API keys exactly like Chat's pump/attempt, via
-// the same keyrotation.Run + isRetryable.
+// the same keyrotation.Run + p.classify (sharing the same p.bans) — there's
+// no first-response-timeout check here since this call isn't streaming, so
+// there's no "before anything forwarded" window to bound; the request
+// either returns within ctx or it doesn't.
 func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (json.RawMessage, error) {
 	system, contents := toGeminiContents(req.Messages)
 	temperature := req.Temperature
@@ -380,7 +529,7 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 	start := time.Now()
 	var result json.RawMessage
 	var usage *genai.GenerateContentResponseUsageMetadata
-	err := keyrotation.Run(ctx, p.logger, "gemini-structured", len(p.clients), rotCfg, isRetryable,
+	err := keyrotation.Run(ctx, p.logger, "gemini-structured", len(p.clients), rotCfg, p.bans, p.classify,
 		func(ctx context.Context, i int) error {
 			resp, err := p.clients[i].Models.GenerateContent(ctx, p.model, contents, cfg)
 			if err != nil {
@@ -459,10 +608,63 @@ func toLLMToolCall(fc *genai.FunctionCall, thoughtSignature []byte, index int) l
 	return llm.ToolCall{ID: id, Name: fc.Name, Arguments: string(argsJSON), ProviderMetadata: providerMetadata}
 }
 
+// isOverloaded reports whether err is Gemini's specific "backend overloaded"
+// shape — HTTP 503 with status UNAVAILABLE — as opposed to some other,
+// unrelated 5xx (e.g. a genuine 500 bug). Only this specific shape is
+// treated as retryable/bannable; see isRetryable's doc comment for why a
+// bare 5xx otherwise still fails immediately.
+func isOverloaded(err error) bool {
+	var apiErr genai.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Code == http.StatusServiceUnavailable && apiErr.Status == "UNAVAILABLE"
+}
+
+// isAuthFailure reports whether err is a per-key auth failure (HTTP 401
+// Unauthorized / 403 Forbidden) — a revoked, disabled, or otherwise invalid
+// key. Used only to pick a more pointed log message (see logKeyRotate):
+// unlike quota/overload, this condition never clears on its own, so it is
+// deliberately never banned (see banDuration) — a fixed-duration ban would
+// just delay, not fix, the same failure repeating on every future call.
+func isAuthFailure(err error) bool {
+	var apiErr genai.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Code == http.StatusUnauthorized || apiErr.Code == http.StatusForbidden
+}
+
+// logKeyRotate logs the WARN for a retryable per-attempt error right before
+// keyrotation.Run moves on to the next key. An auth failure gets a distinct,
+// more pointed message: unlike quota/overload (which recover on their own
+// and get banned accordingly — see banDuration), an invalid/revoked key
+// stays invalid, is never banned, and so will be retried and fail again on
+// EVERY future call until a human fixes or removes it from api_key_envs —
+// worth flagging louder than a routine, self-resolving rotation.
+func (p *Provider) logKeyRotate(keyIndex int, err error) {
+	if isAuthFailure(err) {
+		p.logger.Warn("gemini: key auth failure (401/403) — key looks invalid or revoked and needs manual attention; not banned, so it will be retried again on every future call until fixed", "provider", p.name, "key_index", keyIndex, "error", err)
+		return
+	}
+	p.logger.Warn("gemini: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", err)
+}
+
 // isRetryable reports whether err is worth rotating to the next key for:
 //   - a quota/rate-limit error (HTTP 429, or APIError.Status ==
 //     "RESOURCE_EXHAUSTED") — quota is tracked per key, so a different
 //     configured key plausibly has budget left.
+//   - Gemini's own "overloaded" shape (see isOverloaded) or
+//     errFirstResponseTimeout — a different key (especially a
+//     differently-tiered one, e.g. a paid key configured after a free-tier
+//     key) may simply not be hitting the same overloaded capacity pool.
+//     This used to be excluded entirely (see the production-incident note
+//     below) — it's back specifically for this shape, gated by
+//     keyrotation.Banlist: an overloaded key gets banned for
+//     RotationConfig.OverloadBanMinutes when it happens, so a run of
+//     several configured keys all hitting the same genuine outage still
+//     only pays the multiplied latency once, not on every subsequent
+//     request until the outage clears.
 //   - a per-key auth failure (HTTP 401 Unauthorized / 403 Forbidden) — this
 //     is a property of THAT key specifically (revoked, disabled, or a
 //     per-key restriction hit independent of quota), not of the request,
@@ -472,24 +674,22 @@ func toLLMToolCall(fc *genai.FunctionCall, thoughtSignature []byte, index int) l
 //     below — rotating keys only helps when the fault is IN the key, not
 //     in what's being asked.
 //
-// A server-side error (HTTP 5xx, e.g. 503 "high demand") is deliberately
-// NOT retried here, even though an earlier version of this function treated
-// it the same as a quota error. A 5xx means the backend itself is
-// struggling — every configured key hits the same overloaded service, so
-// cycling through all of them just repeats the identical failure N times
-// (each with its own latency) before eventually giving up — found in
-// production (2026-08-27): a single 503 during OCR turned into 4 back-to-back
-// 503s, one per configured key, delaying the actual escalation to a
-// different provider by several times over. The right response to a 5xx is
-// the caller's own cross-provider escalation (e.g.
-// extraction.ocrWithEscalation falling over from Gemini to Claude), not
-// key rotation within Gemini — so isRetryable now returns false here and
-// lets the first 5xx surface immediately.
+// Any OTHER server-side error (a bare 5xx that isn't Gemini's specific
+// "UNAVAILABLE" overload shape) is deliberately still NOT retried — found
+// in production (2026-08-27): a single 503 during OCR turned into 4
+// back-to-back 503s, one per configured key, delaying the actual escalation
+// to a different provider by several times over. The right response to an
+// unrecognized 5xx is the caller's own cross-provider escalation (e.g.
+// extraction.ocrWithEscalation falling over from Gemini to Claude), not key
+// rotation within Gemini.
 //
 // Any other error (a malformed request, or a network failure before any
 // HTTP response came back) is not retried either: cycling keys can't fix a
 // request that's simply wrong.
 func isRetryable(err error) bool {
+	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+		return true
+	}
 	var apiErr genai.APIError
 	if !errors.As(err, &apiErr) {
 		return false
@@ -499,6 +699,27 @@ func isRetryable(err error) bool {
 		return true
 	}
 	return apiErr.Status == "RESOURCE_EXHAUSTED"
+}
+
+// banDuration reports how long to ban the key that produced err on the
+// shared keyrotation.Banlist — 0 means "retry, but don't ban" (a per-key
+// auth failure is retryable but isn't a transient condition a timed ban
+// would help with; it needs the key itself fixed).
+func banDuration(err error, quotaBan, overloadBan time.Duration) time.Duration {
+	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+		return overloadBan
+	}
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) && (apiErr.Code == http.StatusTooManyRequests || apiErr.Status == "RESOURCE_EXHAUSTED") {
+		return quotaBan
+	}
+	return 0
+}
+
+// classify adapts isRetryable/banDuration to keyrotation.Run's classify
+// shape, supplying this Provider's configured ban durations.
+func (p *Provider) classify(err error) (retryable bool, ban time.Duration) {
+	return isRetryable(err), banDuration(err, p.rotation.quotaBan(), p.rotation.overloadBan())
 }
 
 // trace serializes the actual request (contents + cfg) and response (text +

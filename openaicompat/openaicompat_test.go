@@ -1,13 +1,16 @@
 package openaicompat
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/openai/openai-go/v2"
 	"github.com/stretchr/testify/require"
@@ -17,21 +20,41 @@ import (
 
 // --- The httptest.Server-backed key-rotation suite, mirroring
 // gemini_test.go/anthropic_test.go's own — see isRetryable's doc comment
-// for the reasoning this exercises (429/401/403 rotate, 5xx does not).
+// for the reasoning this exercises (429/401/403/503 rotate, other 5xx does
+// not).
 
 func TestIsRetryable(t *testing.T) {
 	require.True(t, isRetryable(&openai.Error{StatusCode: http.StatusTooManyRequests}))
 	require.True(t, isRetryable(&openai.Error{StatusCode: http.StatusUnauthorized}))
 	require.True(t, isRetryable(&openai.Error{StatusCode: http.StatusForbidden}))
 
-	// 5xx is deliberately NOT retryable: every configured key hits the same
-	// overloaded backend, so rotating keys just repeats the identical
-	// failure — see isRetryable's doc comment.
+	// 503 (the one HTTP status universally meaning "temporarily overloaded"
+	// across REST APIs) IS retryable — a different, differently-tiered key
+	// may not be hitting the same overloaded capacity. errFirstResponseTimeout
+	// is treated identically.
+	require.True(t, isRetryable(&openai.Error{StatusCode: http.StatusServiceUnavailable}))
+	require.True(t, isRetryable(errFirstResponseTimeout))
+
+	// Any OTHER 5xx is deliberately still NOT retryable: every configured
+	// key hits the same struggling backend, so rotating keys just repeats
+	// the identical failure — see isRetryable's doc comment.
 	require.False(t, isRetryable(&openai.Error{StatusCode: http.StatusInternalServerError}))
-	require.False(t, isRetryable(&openai.Error{StatusCode: http.StatusServiceUnavailable}))
 
 	require.False(t, isRetryable(&openai.Error{StatusCode: http.StatusBadRequest}))
 	require.False(t, isRetryable(errors.New("some unrelated network error")))
+}
+
+func TestBanDuration(t *testing.T) {
+	quotaBan := 30 * time.Minute
+	overloadBan := 45 * time.Minute
+
+	require.Equal(t, quotaBan, banDuration(&openai.Error{StatusCode: http.StatusTooManyRequests}, quotaBan, overloadBan))
+	require.Equal(t, overloadBan, banDuration(&openai.Error{StatusCode: http.StatusServiceUnavailable}, quotaBan, overloadBan))
+	require.Equal(t, overloadBan, banDuration(errFirstResponseTimeout, quotaBan, overloadBan))
+
+	require.Zero(t, banDuration(&openai.Error{StatusCode: http.StatusUnauthorized}, quotaBan, overloadBan))
+	require.Zero(t, banDuration(&openai.Error{StatusCode: http.StatusForbidden}, quotaBan, overloadBan))
+	require.Zero(t, banDuration(&openai.Error{StatusCode: http.StatusBadRequest}, quotaBan, overloadBan))
 }
 
 // scriptedResponse is one fake server reply, in the order Chat's/
@@ -75,8 +98,14 @@ func openaiSuccessBody(t *testing.T, text string) string {
 // quotaErrorBody is a 429 rate-limit response body.
 const quotaErrorBody = `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`
 
-// serverErrorBody is a generic 5xx response body.
+// serverErrorBody is a 503 ("overloaded") response body — retryable/
+// bannable, unlike a non-503 5xx (see isRetryable's doc comment).
 const serverErrorBody = `{"error":{"message":"backend overloaded","type":"server_error","code":null}}`
+
+// genericServerErrorBody is a 5xx that is NOT 503 — must still fail
+// immediately without rotating, per the 2026-08-27 incident this behavior
+// is named after.
+const genericServerErrorBody = `{"error":{"message":"internal error","type":"server_error","code":null}}`
 
 // badRequestBody is a non-retryable 400 response body.
 const badRequestBody = `{"error":{"message":"bad request","type":"invalid_request_error","code":null}}`
@@ -183,14 +212,58 @@ func TestOpenAICompat_RotatesOnQuotaError(t *testing.T) {
 	require.Equal(t, 2, requestCount(), "exactly one request per key, no needless extra cycling")
 }
 
-// TestOpenAICompat_ServerErrorFailsImmediatelyWithoutRotating is the
-// OpenAI-compat counterpart to gemini's/anthropic's own — same production
-// incident (2026-08-27), same fix, third provider.
-func TestOpenAICompat_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+// TestOpenAICompat_OverloadedRotatesAndBansTheKey is the OpenAI-compat
+// counterpart to gemini's/anthropic's own overload test: a 503 now rotates
+// to the next configured key and bans the overloaded one on p.bans.
+func TestOpenAICompat_OverloadedRotatesAndBansTheKey(t *testing.T) {
 	script := []scriptedResponse{
 		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		{body: openaiSuccessBody(t, "hi from key 2")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.Equal(t, 2, requestCount())
+	require.True(t, p.bans.Banned(0), "the overloaded key must be banned")
+	require.False(t, p.bans.Banned(1))
+}
+
+// TestOpenAICompat_OverloadedKeyIsSkippedOnNextCall mirrors gemini's/
+// anthropic's own.
+func TestOpenAICompat_OverloadedKeyIsSkippedOnNextCall(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusServiceUnavailable, errBody: serverErrorBody},
+		{body: openaiSuccessBody(t, "first call, key 2")},
+		{body: openaiSuccessBody(t, "second call, key 2 again")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.Equal(t, 2, requestCount())
+
+	ch2, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi again"}}})
+	require.NoError(t, err)
+	got2 := collect(t, ch2)
+
+	require.Equal(t, "second call, key 2 again", got2.Text)
+	require.Equal(t, 3, requestCount(), "the banned key must be skipped outright, not requested a second time")
+}
+
+// TestOpenAICompat_GenericServerErrorFailsImmediatelyWithoutRotating is the
+// OpenAI-compat counterpart to gemini's/anthropic's own — same production
+// incident (2026-08-27), same fix, third provider: a non-503 5xx must still
+// fail on the first key.
+func TestOpenAICompat_GenericServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusInternalServerError, errBody: genericServerErrorBody},
 		// A second scripted entry that would fail the test via
-		// newTestServer's t.Fatalf if it were ever requested — proof a 5xx
+		// newTestServer's t.Fatalf if it were ever requested — proof this
 		// does not rotate to the next key.
 		{body: openaiSuccessBody(t, "should never be reached")},
 	}
@@ -201,7 +274,7 @@ func TestOpenAICompat_ServerErrorFailsImmediatelyWithoutRotating(t *testing.T) {
 	gotErr := collectErr(t, ch)
 
 	require.Error(t, gotErr)
-	require.Equal(t, 1, requestCount(), "a 5xx must not rotate to the next key")
+	require.Equal(t, 1, requestCount(), "a non-503 5xx must not rotate to the next key")
 }
 
 func TestOpenAICompat_NonRetryableErrorFailsImmediately(t *testing.T) {
@@ -234,10 +307,41 @@ func TestOpenAICompat_RotatesOnAuthError(t *testing.T) {
 	require.Equal(t, 2, requestCount())
 }
 
-func TestOpenAICompat_AllKeysExhaustedAfterCycles(t *testing.T) {
+// TestOpenAICompat_AuthFailureLogsDistinctWarning mirrors gemini's/
+// anthropic's own: a 401/403 is never banned (see banDuration) and so will
+// repeat on every future call until a human fixes the key — this asserts
+// that WARN line is distinguishable from the generic "trying next key"
+// one, not just present.
+func TestOpenAICompat_AuthFailureLogsDistinctWarning(t *testing.T) {
 	script := []scriptedResponse{
-		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
-		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{statusCode: http.StatusUnauthorized, errBody: `{"error":{"message":"invalid key","type":"authentication_error","code":null}}`},
+		{body: openaiSuccessBody(t, "hi from key 2")},
+	}
+	baseURL, requestCount := newTestServer(t, script)
+
+	t.Setenv("OPENAI_AUTH_LOG_TEST_KEY_0", "fake-key-0")
+	t.Setenv("OPENAI_AUTH_LOG_TEST_KEY_1", "fake-key-1")
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	p := New("openaicompat-test", baseURL, "test-model",
+		[]string{"OPENAI_AUTH_LOG_TEST_KEY_0", "OPENAI_AUTH_LOG_TEST_KEY_1"},
+		RotationConfig{}, logger)
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.Equal(t, 2, requestCount())
+
+	require.Contains(t, buf.String(), "auth failure", "a 401/403 must log a distinct message, not the generic rotation one")
+	require.Contains(t, buf.String(), "manual attention")
+	require.NotContains(t, buf.String(), "key error, trying next key", "the generic rotation message must not ALSO fire for an auth failure")
+}
+
+// TestOpenAICompat_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle
+// mirrors gemini's/anthropic's own — see their doc comments for why banning
+// makes the second cycle a no-op here.
+func TestOpenAICompat_AllKeysBannedAfterFirstCycleFailsFastWithoutASecondCycle(t *testing.T) {
+	script := []scriptedResponse{
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
 	}
@@ -248,8 +352,69 @@ func TestOpenAICompat_AllKeysExhaustedAfterCycles(t *testing.T) {
 	gotErr := collectErr(t, ch)
 
 	require.Error(t, gotErr)
-	require.Contains(t, gotErr.Error(), "exhausted")
-	require.Equal(t, 4, requestCount(), "2 keys x 2 cycles")
+	require.Contains(t, gotErr.Error(), "banned")
+	require.Equal(t, 2, requestCount(), "cycle 2 must find every key already banned and skip straight to failing")
+}
+
+// TestOpenAICompat_QuotaErrorBansTheKeyForFutureCalls mirrors gemini's/
+// anthropic's own.
+func TestOpenAICompat_QuotaErrorBansTheKeyForFutureCalls(t *testing.T) {
+	script := []scriptedResponse{
+		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},
+		{body: openaiSuccessBody(t, "first call, key 2")},
+		{body: openaiSuccessBody(t, "second call, key 2 again")},
+	}
+	p, requestCount := newTestProvider(t, 2, script, RotationConfig{})
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	collect(t, ch)
+	require.True(t, p.bans.Banned(0))
+
+	ch2, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi again"}}})
+	require.NoError(t, err)
+	got2 := collect(t, ch2)
+
+	require.Equal(t, "second call, key 2 again", got2.Text)
+	require.Equal(t, 3, requestCount())
+}
+
+// TestOpenAICompat_FirstResponseTimeoutRotatesAndBans mirrors gemini's/
+// anthropic's own: a backend that accepts the connection but never sends a
+// single chunk within OverloadTimeoutSeconds must be treated as overloaded
+// (ban + rotate).
+func TestOpenAICompat_FirstResponseTimeoutRotatesAndBans(t *testing.T) {
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		if idx == 0 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(openaiSuccessBody(t, "hi from key 2")))
+	}))
+	defer ts.Close()
+
+	t.Setenv("OPENAI_TIMEOUT_TEST_KEY_0", "fake-key-0")
+	t.Setenv("OPENAI_TIMEOUT_TEST_KEY_1", "fake-key-1")
+	p := New("openaicompat-test", ts.URL, "test-model",
+		[]string{"OPENAI_TIMEOUT_TEST_KEY_0", "OPENAI_TIMEOUT_TEST_KEY_1"},
+		RotationConfig{OverloadTimeoutSeconds: 1}, nil)
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "hi from key 2", got.Text)
+	require.True(t, p.bans.Banned(0), "the slow-to-respond key must be banned")
 }
 
 func TestOpenAICompat_StructuredRotatesOnQuotaError(t *testing.T) {

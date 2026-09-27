@@ -6,8 +6,14 @@
 // used for every provider that isn't native Anthropic or native Gemini. See
 // the gemini package for the sibling adapter this mirrors, including the
 // same api_key_envs-driven key rotation (see keyrotation, isRetryable) —
-// rotates on quota (429) and per-key auth errors (401/403), deliberately
-// NOT on 5xx server errors.
+// rotates on quota (429), a 503 (the one HTTP status universally meaning
+// "temporarily overloaded" regardless of which backend baseURL points at —
+// see isOverloaded), a first-response timeout (see attempt), and per-key
+// auth errors (401/403). A quota or overload rotation also bans that key on
+// the shared keyrotation.Banlist for a configurable duration, so a
+// deployment that orders a free-tier key before a paid one fails over on
+// the very next request instead of re-discovering the same failure from
+// scratch — see isRetryable/banDuration.
 package openaicompat
 
 import (
@@ -48,12 +54,56 @@ func toParamOpt(v *float64) param.Opt[float64] {
 }
 
 // RotationConfig tunes this package's key-rotation. The zero value falls
-// back to keyrotation's built-in defaults (1 cycle, no cooldown). Mirrors
-// gemini.RotationConfig/anthropic.RotationConfig — same shape, same
-// meaning.
+// back to keyrotation's built-in defaults (1 cycle, no cooldown) plus this
+// package's own ban defaults (30min/30min/10s). Field-for-field identical
+// (same names, types, order) to gemini.RotationConfig/
+// anthropic.RotationConfig on purpose — see gemini.RotationConfig's doc
+// comment for why.
 type RotationConfig struct {
 	CooldownSeconds int
 	MaxRetryCycles  int
+	// QuotaBanMinutes is how long a key that hit a quota/rate-limit error
+	// (429) is skipped by every subsequent Chat/Structured call, not just
+	// retried within the current one. <= 0 uses defaultQuotaBan.
+	QuotaBanMinutes int
+	// OverloadBanMinutes is the same idea for a key that looks overloaded
+	// (see isOverloaded), or timed out waiting for a first response (see
+	// attempt). <= 0 uses defaultOverloadBan.
+	OverloadBanMinutes int
+	// OverloadTimeoutSeconds bounds how long attempt waits for the FIRST
+	// streamed event before treating the key as overloaded. <= 0 uses
+	// defaultOverloadTimeout.
+	OverloadTimeoutSeconds int
+}
+
+// Built-in ban/timeout defaults applied whenever the corresponding
+// RotationConfig field is <= 0 — mirrors gemini.RotationConfig's own
+// defaults.
+const (
+	defaultQuotaBan        = 30 * time.Minute
+	defaultOverloadBan     = 30 * time.Minute
+	defaultOverloadTimeout = 10 * time.Second
+)
+
+func (r RotationConfig) quotaBan() time.Duration {
+	if r.QuotaBanMinutes <= 0 {
+		return defaultQuotaBan
+	}
+	return time.Duration(r.QuotaBanMinutes) * time.Minute
+}
+
+func (r RotationConfig) overloadBan() time.Duration {
+	if r.OverloadBanMinutes <= 0 {
+		return defaultOverloadBan
+	}
+	return time.Duration(r.OverloadBanMinutes) * time.Minute
+}
+
+func (r RotationConfig) overloadTimeout() time.Duration {
+	if r.OverloadTimeoutSeconds <= 0 {
+		return defaultOverloadTimeout
+	}
+	return time.Duration(r.OverloadTimeoutSeconds) * time.Second
 }
 
 // Provider is an llm.Provider (and llm.StructuredProvider) backed by any
@@ -66,8 +116,12 @@ type Provider struct {
 	model    string
 	clients  []openai.Client // one per resolved API key, in configured order
 	rotation RotationConfig
-	tracer   llm.Tracer
-	logger   *slog.Logger
+	// bans is shared across every Chat/Structured call this Provider ever
+	// makes (constructed once in New, never per-call) — mirrors
+	// gemini.Provider.bans; see keyrotation.Banlist.
+	bans   *keyrotation.Banlist
+	tracer llm.Tracer
+	logger *slog.Logger
 }
 
 // New builds a Provider named name, targeting model on the endpoint at
@@ -111,7 +165,7 @@ func New(name, baseURL, model string, apiKeyEnvs []string, rotation RotationConf
 		clients = []openai.Client{openai.NewClient(baseOpts...)}
 	}
 
-	return &Provider{name: name, model: model, clients: clients, rotation: rotation, logger: logger}
+	return &Provider{name: name, model: model, clients: clients, rotation: rotation, bans: keyrotation.NewBanlist(), logger: logger}
 }
 
 func (p *Provider) Name() string { return p.name }
@@ -150,9 +204,10 @@ type pendingToolCall struct {
 }
 
 // pump rotates across p.clients (one per configured API key) via
-// keyrotation.Run using isRetryable (quota AND per-key auth failures only —
-// see its doc comment for why 5xx is deliberately excluded), mirroring
-// gemini.Provider.pump/anthropic.Provider.pump.
+// keyrotation.Run, classifying each error via p.classify — quota, overload
+// (503, or a first-response timeout), and per-key auth failures all rotate
+// to the next key; quota/overload also ban that key on p.bans for future
+// calls — mirrors gemini.Provider.pump/anthropic.Provider.pump.
 func (p *Provider) pump(ctx context.Context, params openai.ChatCompletionNewParams, out chan<- llm.StreamChunk) {
 	defer close(out)
 
@@ -160,7 +215,7 @@ func (p *Provider) pump(ctx context.Context, params openai.ChatCompletionNewPara
 		Cycles:   p.rotation.MaxRetryCycles,
 		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
-	err := keyrotation.Run(ctx, p.logger, "openaicompat", len(p.clients), rotCfg, isRetryable,
+	err := keyrotation.Run(ctx, p.logger, "openaicompat", len(p.clients), rotCfg, p.bans, p.classify,
 		func(ctx context.Context, i int) error {
 			return p.attempt(ctx, i, params, out)
 		},
@@ -182,6 +237,12 @@ func (p *Provider) pump(ctx context.Context, params openai.ChatCompletionNewPara
 // the same name.
 var errAttemptWritten = errors.New("openaicompat: attempt already wrote its terminal error")
 
+// errFirstResponseTimeout means attempt gave up waiting for the first
+// streamed chunk within RotationConfig.OverloadTimeoutSeconds, before
+// anything was forwarded to the caller — mirrors gemini/anthropic's
+// sentinel of the same name/reasoning.
+var errFirstResponseTimeout = errors.New("openaicompat: no response within first-response timeout")
+
 // attempt makes exactly one Chat.Completions.NewStreaming call against one
 // client (one API key), forwarding text deltas to out live as they arrive
 // and, via the SDK's own ChatCompletionAccumulator, reconstructing the full
@@ -194,11 +255,19 @@ var errAttemptWritten = errors.New("openaicompat: attempt already wrote its term
 // otherwise say yes — mirrors gemini/anthropic's own forwarded-then-error
 // rule; see anthropic.Provider.attempt's doc comment for the full
 // reasoning.
+//
+// Before anything is forwarded, attempt also bounds how long it waits for
+// the very FIRST chunk via RotationConfig.OverloadTimeoutSeconds — mirrors
+// gemini/anthropic's own first-response watchdog; see gemini.Provider.
+// attempt's doc comment for the full reasoning.
 func (p *Provider) attempt(ctx context.Context, keyIndex int, params openai.ChatCompletionNewParams, out chan<- llm.StreamChunk) error {
+	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	defer cancelAttempt()
+
 	// NewStreaming performs the actual HTTP request eagerly (before this
 	// call returns), so a 429/401/403/5xx from the initial request surfaces
 	// via stream.Err() below exactly like a mid-stream error would.
-	stream := p.clients[keyIndex].Chat.Completions.NewStreaming(ctx, params)
+	stream := p.clients[keyIndex].Chat.Completions.NewStreaming(attemptCtx, params)
 
 	var acc openai.ChatCompletionAccumulator
 	forwarded := false
@@ -208,7 +277,34 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params openai.Chat
 	pending := map[int64]*pendingToolCall{}
 	var order []int64
 
-	for stream.Next() {
+	first := true
+	for {
+		var hasNext bool
+		if first {
+			first = false
+			var abandoned bool
+			hasNext, abandoned = keyrotation.FirstStepTimeout(ctx, p.rotation.overloadTimeout(), stream.Next)
+			if abandoned {
+				// stream.Next() may still be running on the goroutine
+				// FirstStepTimeout spawned — cancelling attemptCtx unblocks
+				// it promptly; this attempt must not touch stream again
+				// without waiting for that goroutine first, which it never
+				// does: it just returns, leaving the abandoned call to
+				// finish and be garbage collected on its own — mirrors
+				// anthropic.Provider.attempt's identical handling.
+				cancelAttempt()
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				p.logger.Warn("openaicompat: no response within first-response timeout, treating key as overloaded", "provider", p.name, "key_index", keyIndex, "timeout", p.rotation.overloadTimeout())
+				return errFirstResponseTimeout
+			}
+		} else {
+			hasNext = stream.Next()
+		}
+		if !hasNext {
+			break
+		}
 		chunk := stream.Current()
 		acc.AddChunk(chunk)
 		if len(chunk.Choices) == 0 {
@@ -247,7 +343,7 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params openai.Chat
 			return errAttemptWritten
 		}
 		if isRetryable(streamErr) {
-			p.logger.Warn("openaicompat: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", streamErr)
+			p.logKeyRotate(keyIndex, streamErr)
 			return streamErr
 		}
 		p.logger.Error("openaicompat: request failed", "provider", p.name, "key_index", keyIndex, "error", streamErr)
@@ -267,22 +363,79 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params openai.Chat
 	return nil
 }
 
+// isOverloaded reports whether err carries HTTP 503 — the one status code
+// universally meaning "temporarily overloaded, try again" across REST APIs
+// regardless of which backend baseURL points at (unlike Anthropic/Gemini,
+// there's no single semantic error-type field a generic OpenAI-compatible
+// backend is guaranteed to populate consistently — see isRetryable's doc
+// comment). Other 5xx codes (500/502/504) are more likely to indicate a
+// genuine backend bug a retry can't fix, so only 503 is treated as
+// retryable/bannable here — mirrors gemini/anthropic's own "specific shape
+// only" scoping.
+func isOverloaded(err error) bool {
+	var apiErr *openai.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusServiceUnavailable
+}
+
+// isAuthFailure reports whether err is a per-key auth failure (HTTP 401
+// Unauthorized / 403 Forbidden) — a revoked, disabled, or otherwise invalid
+// key. Used only to pick a more pointed log message (see logKeyRotate):
+// unlike quota/overload, this condition never clears on its own, so it is
+// deliberately never banned (see banDuration) — a fixed-duration ban would
+// just delay, not fix, the same failure repeating on every future call.
+func isAuthFailure(err error) bool {
+	var apiErr *openai.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden
+}
+
+// logKeyRotate logs the WARN for a retryable per-attempt error right before
+// keyrotation.Run moves on to the next key — mirrors gemini/anthropic's
+// own. An auth failure gets a distinct, more pointed message: unlike
+// quota/overload (banned — see banDuration), an invalid/revoked key stays
+// invalid and will be retried and fail again on EVERY future call until a
+// human fixes or removes it from api_key_envs.
+func (p *Provider) logKeyRotate(keyIndex int, err error) {
+	if isAuthFailure(err) {
+		p.logger.Warn("openaicompat: key auth failure (401/403) — key looks invalid or revoked and needs manual attention; not banned, so it will be retried again on every future call until fixed", "provider", p.name, "key_index", keyIndex, "error", err)
+		return
+	}
+	p.logger.Warn("openaicompat: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", err)
+}
+
 // isRetryable reports whether err is worth rotating to the next key for —
 // mirrors gemini.isRetryable/anthropic's own version, just against the
 // OpenAI-compatible SDK's error shape (*openai.Error, carrying StatusCode):
 //   - a quota/rate-limit error (HTTP 429).
+//   - HTTP 503 (see isOverloaded) or errFirstResponseTimeout — a different
+//     key (especially a differently-tiered one) may not be hitting the same
+//     overloaded capacity. This used to be excluded entirely (see the
+//     production-incident note below) — it's back specifically for this
+//     shape, gated by keyrotation.Banlist: an overloaded key gets banned
+//     for RotationConfig.OverloadBanMinutes when it happens, so a run of
+//     several configured keys all hitting the same genuine outage still
+//     only pays the multiplied latency once, not on every subsequent
+//     request until the outage clears.
 //   - a per-key auth failure (HTTP 401 Unauthorized / 403 Forbidden).
 //
-// A server-side error (HTTP 5xx) is deliberately NOT retried — every
-// configured key hits the same struggling backend, so cycling through them
-// just repeats the identical failure. See gemini.isRetryable's doc comment
-// for the production incident (2026-08-27) this reasoning is shared with.
-// Note this is a generic fallback for whatever backend baseURL points at
-// (OpenAI itself, or a self-hosted server) — a local backend's own error
-// shape may not populate StatusCode the same way OpenAI's does, in which
-// case this simply returns false and the first failure surfaces
-// immediately, same as today.
+// Any OTHER server-side error (a 5xx that isn't 503) is deliberately still
+// NOT retried — every configured key hits the same struggling backend, so
+// cycling through them just repeats the identical failure. See
+// gemini.isRetryable's doc comment for the production incident (2026-08-27)
+// this reasoning is shared with. Note this is a generic fallback for
+// whatever backend baseURL points at (OpenAI itself, or a self-hosted
+// server) — a local backend's own error shape may not populate StatusCode
+// the same way OpenAI's does, in which case this simply returns false and
+// the first failure surfaces immediately, same as today.
 func isRetryable(err error) bool {
+	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+		return true
+	}
 	var apiErr *openai.Error
 	if !errors.As(err, &apiErr) {
 		return false
@@ -292,6 +445,27 @@ func isRetryable(err error) bool {
 		return true
 	}
 	return false
+}
+
+// banDuration reports how long to ban the key that produced err on the
+// shared keyrotation.Banlist — 0 means "retry, but don't ban" (a per-key
+// auth failure is retryable but isn't a transient condition a timed ban
+// would help with).
+func banDuration(err error, quotaBan, overloadBan time.Duration) time.Duration {
+	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+		return overloadBan
+	}
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests {
+		return quotaBan
+	}
+	return 0
+}
+
+// classify adapts isRetryable/banDuration to keyrotation.Run's classify
+// shape, supplying this Provider's configured ban durations.
+func (p *Provider) classify(err error) (retryable bool, ban time.Duration) {
+	return isRetryable(err), banDuration(err, p.rotation.quotaBan(), p.rotation.overloadBan())
 }
 
 // Structured implements llm.StructuredProvider using Chat Completions'
@@ -325,18 +499,20 @@ func (p *Provider) Structured(ctx context.Context, req llm.StructuredRequest) (j
 	}
 
 	// Rotates across configured API keys exactly like Chat's pump/attempt,
-	// via the same keyrotation.Run + isRetryable.
+	// via the same keyrotation.Run + p.classify (sharing the same p.bans) —
+	// no first-response-timeout check here since this is a single
+	// non-streaming call.
 	var result json.RawMessage
 	rotCfg := keyrotation.Config{
 		Cycles:   p.rotation.MaxRetryCycles,
 		Cooldown: time.Duration(p.rotation.CooldownSeconds) * time.Second,
 	}
-	err := keyrotation.Run(ctx, p.logger, "openaicompat-structured", len(p.clients), rotCfg, isRetryable,
+	err := keyrotation.Run(ctx, p.logger, "openaicompat-structured", len(p.clients), rotCfg, p.bans, p.classify,
 		func(ctx context.Context, keyIndex int) error {
 			resp, err := p.clients[keyIndex].Chat.Completions.New(ctx, params)
 			if err != nil {
 				if isRetryable(err) {
-					p.logger.Warn("openaicompat: key error, trying next key", "provider", p.name, "key_index", keyIndex, "error", err)
+					p.logKeyRotate(keyIndex, err)
 				} else {
 					p.logger.Error("openaicompat: request failed", "provider", p.name, "key_index", keyIndex, "error", err)
 				}
