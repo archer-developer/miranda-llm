@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -594,6 +595,52 @@ func TestAnthropic_FirstResponseTimeoutRotatesAndBans(t *testing.T) {
 
 	require.Equal(t, "hi from key 2", got.Text)
 	require.True(t, p.bans.Banned(0), "the slow-to-respond key must be banned")
+}
+
+// TestAnthropic_SlowButSuccessfulCallBansKeyAfterwards mirrors gemini's
+// TestGemini_SlowButSuccessfulCallBansKeyAfterwards: the key delivers its
+// first content_block_delta promptly (so the first-response watchdog never
+// fires), then the rest of the stream arrives long after
+// OverloadTimeoutSeconds. The call must still succeed on key 0, but key 0
+// must come out banned so a later call skips straight to another key.
+func TestAnthropic_SlowButSuccessfulCallBansKeyAfterwards(t *testing.T) {
+	full := anthropicSuccessBody(t, "slow but successful")
+	splitAt := strings.Index(full, "event: content_block_stop")
+	require.Greater(t, splitAt, 0, "test fixture must contain a content_block_stop event to split on")
+	first, rest := full[:splitAt], full[splitAt:]
+
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(first))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Well past OverloadTimeoutSeconds below, but the first delta above
+		// already went out before this sleep starts.
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = w.Write([]byte(rest))
+	}))
+	defer ts.Close()
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("ANTHROPIC_SLOW_TEST_KEY_0", "fake-key-0")
+	p, err := New("anthropic-test", "claude-test-model",
+		[]string{"ANTHROPIC_SLOW_TEST_KEY_0"},
+		ToolsConfig{}, RotationConfig{OverloadTimeoutSeconds: 1}, nil)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	got := collect(t, ch)
+
+	require.Equal(t, "slow but successful", got.Text, "the slow call must still succeed and deliver its already-forwarded content")
+	require.Equal(t, 1, requestCount)
+	require.True(t, p.bans.Banned(0), "a key that took longer than the overload timeout end-to-end must be banned even though it succeeded")
 }
 
 func TestAnthropic_StructuredRotatesOnQuotaError(t *testing.T) {

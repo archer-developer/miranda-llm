@@ -591,6 +591,48 @@ func TestGemini_FirstResponseTimeoutRotatesAndBans(t *testing.T) {
 	require.True(t, p.bans.Banned(0), "the slow-to-respond key must be banned")
 }
 
+// TestGemini_SlowButSuccessfulCallBansKeyAfterwards is the post-hoc
+// counterpart to TestGemini_FirstResponseTimeoutRotatesAndBans: the key
+// answers its first event promptly (so the first-response watchdog never
+// fires) but then takes far longer than OverloadTimeoutSeconds to finish
+// streaming the rest of the response. The call must still succeed on key 0
+// (nothing about the completed response is discarded or retried), but key 0
+// must come out banned so the NEXT call skips straight to key 1 — see
+// keyrotation.BanIfSlow.
+func TestGemini_SlowButSuccessfulCallBansKeyAfterwards(t *testing.T) {
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(textEvent(t, "slow but successful")))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Well past OverloadTimeoutSeconds below, but the first event above
+		// already went out before this sleep starts.
+		time.Sleep(1200 * time.Millisecond)
+	}))
+	defer ts.Close()
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("GEMINI_SLOW_TEST_KEY_A", "fake-key-a")
+	p, err := New(context.Background(), "gemini-test", "gemini-test-model",
+		[]string{"GEMINI_SLOW_TEST_KEY_A"},
+		ToolsConfig{}, RotationConfig{OverloadTimeoutSeconds: 1}, nil)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	got := collect(t, ch)
+
+	require.Equal(t, "slow but successful", got.Text, "the slow call must still succeed and deliver its already-forwarded content")
+	require.Equal(t, 1, requestCount)
+	require.True(t, p.bans.Banned(0), "a key that took longer than the overload timeout end-to-end must be banned even though it succeeded")
+}
+
 // TestGemini_RotationEmitsNoChunksFromFailedAttempt confirms rotation still
 // forwards nothing from a key that fails before any content streams (the
 // common case — an HTTP-level error on connect, before Gemini has sent a

@@ -201,3 +201,29 @@ func FirstStepTimeout(ctx context.Context, timeout time.Duration, step func() bo
 		return false, true
 	}
 }
+
+// BanIfSlow bans keyIndex on bans for ban and reports true if elapsed
+// exceeds threshold; otherwise it does nothing and reports false.
+//
+// This is the post-hoc counterpart to FirstStepTimeout: that guard can only
+// judge (and abort) a key before anything has been forwarded to the caller,
+// so a key whose backend answers within the timeout but then takes far
+// longer than that same budget to actually finish streaming the rest of its
+// response never trips it — see each provider's attempt() doc comment for
+// why aborting/retrying a call that has already forwarded output isn't
+// safe. Observed in practice (2026-09-27): a gemini-lite free-tier key
+// answered its first event promptly but then took 16s and 56s end-to-end on
+// two separate calls, well past the 10s overload timeout, and kept getting
+// reused because nothing checked total duration once streaming had started.
+//
+// Called once an attempt has already completed (successfully or not), this
+// still pulls a persistently slow key from rotation for future calls,
+// without touching the outcome of the call that measured it — the response
+// already forwarded to the caller stands as delivered either way.
+func BanIfSlow(bans *Banlist, keyIndex int, elapsed, threshold, ban time.Duration) bool {
+	if elapsed <= threshold {
+		return false
+	}
+	bans.Ban(keyIndex, ban)
+	return true
+}

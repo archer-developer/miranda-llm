@@ -103,13 +103,19 @@ type RotationConfig struct {
 	// defaultQuotaBan.
 	QuotaBanMinutes int
 	// OverloadBanMinutes is the same idea for a key that looks like it hit
-	// an overloaded backend (503 UNAVAILABLE, or a first-response timeout —
-	// see attempt). <= 0 uses defaultOverloadBan.
+	// an overloaded backend (503 UNAVAILABLE, a first-response timeout, or a
+	// call that took longer than OverloadTimeoutSeconds end-to-end even
+	// though it did complete — see attempt and keyrotation.BanIfSlow). <= 0
+	// uses defaultOverloadBan.
 	OverloadBanMinutes int
-	// OverloadTimeoutSeconds bounds how long attempt waits for the FIRST
-	// streamed event before treating the key as overloaded — see attempt's
-	// doc comment for why this is safe only before anything forwards. <= 0
-	// uses defaultOverloadTimeout.
+	// OverloadTimeoutSeconds bounds two separate things attempt checks
+	// against the same budget: how long it waits for the FIRST streamed
+	// event before treating the key as overloaded (see attempt's doc
+	// comment for why aborting/retrying is safe only before anything
+	// forwards), and — post-hoc, once the call has already finished — how
+	// long the whole call was allowed to take before the key gets banned
+	// for future calls anyway (see keyrotation.BanIfSlow). <= 0 uses
+	// defaultOverloadTimeout.
 	OverloadTimeoutSeconds int
 }
 
@@ -492,8 +498,12 @@ func (p *Provider) attempt(ctx context.Context, client *genai.Client, keyIndex i
 		return errAttemptWritten
 	}
 
-	p.logger.Info("gemini: request succeeded", "provider", p.name, "key_index", keyIndex, "duration_ms", time.Since(start).Milliseconds())
-	p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, time.Since(start), usage, nil)
+	elapsed := time.Since(start)
+	if keyrotation.BanIfSlow(p.bans, keyIndex, elapsed, p.rotation.overloadTimeout(), p.rotation.overloadBan()) {
+		p.logger.Warn("gemini: request succeeded but took longer than the overload timeout end-to-end, banning key for future calls", "provider", p.name, "key_index", keyIndex, "duration", elapsed, "timeout", p.rotation.overloadTimeout(), "ban", p.rotation.overloadBan())
+	}
+	p.logger.Info("gemini: request succeeded", "provider", p.name, "key_index", keyIndex, "duration_ms", elapsed.Milliseconds())
+	p.trace(ctx, contents, cfg, textBuf.String(), toolCalls, elapsed, usage, nil)
 	out <- llm.StreamChunk{Done: true}
 	return nil
 }

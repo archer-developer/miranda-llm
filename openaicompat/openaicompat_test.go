@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -415,6 +416,48 @@ func TestOpenAICompat_FirstResponseTimeoutRotatesAndBans(t *testing.T) {
 
 	require.Equal(t, "hi from key 2", got.Text)
 	require.True(t, p.bans.Banned(0), "the slow-to-respond key must be banned")
+}
+
+// TestOpenAICompat_SlowButSuccessfulCallBansKeyAfterwards mirrors gemini's/
+// anthropic's own: the key delivers its first chunk promptly (so the
+// first-response watchdog never fires), then the rest of the stream arrives
+// long after OverloadTimeoutSeconds. The call must still succeed on key 0,
+// but key 0 must come out banned so a later call skips straight to another
+// key.
+func TestOpenAICompat_SlowButSuccessfulCallBansKeyAfterwards(t *testing.T) {
+	full := openaiSuccessBody(t, "slow but successful")
+	parts := strings.SplitN(full, "\n\n", 2)
+	require.Len(t, parts, 2, "test fixture must contain more than one SSE chunk to split on")
+	first, rest := parts[0]+"\n\n", parts[1]
+
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(first))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Well past OverloadTimeoutSeconds below, but the first chunk above
+		// already went out before this sleep starts.
+		time.Sleep(1200 * time.Millisecond)
+		_, _ = w.Write([]byte(rest))
+	}))
+	defer ts.Close()
+
+	t.Setenv("OPENAI_SLOW_TEST_KEY_0", "fake-key-0")
+	p := New("openaicompat-test", ts.URL, "test-model",
+		[]string{"OPENAI_SLOW_TEST_KEY_0"},
+		RotationConfig{OverloadTimeoutSeconds: 1}, nil)
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Equal(t, "slow but successful", got.Text, "the slow call must still succeed and deliver its already-forwarded content")
+	require.Equal(t, 1, requestCount)
+	require.True(t, p.bans.Banned(0), "a key that took longer than the overload timeout end-to-end must be banned even though it succeeded")
 }
 
 func TestOpenAICompat_StructuredRotatesOnQuotaError(t *testing.T) {

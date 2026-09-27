@@ -86,13 +86,17 @@ type RotationConfig struct {
 	// retried within the current one. <= 0 uses defaultQuotaBan.
 	QuotaBanMinutes int
 	// OverloadBanMinutes is the same idea for a key that looks like it hit
-	// Anthropic's own "overloaded" state (see isOverloaded), or timed out
-	// waiting for a first response (see attempt). <= 0 uses
-	// defaultOverloadBan.
+	// Anthropic's own "overloaded" state (see isOverloaded), timed out
+	// waiting for a first response, or took longer than
+	// OverloadTimeoutSeconds end-to-end even though it did complete (see
+	// attempt and keyrotation.BanIfSlow). <= 0 uses defaultOverloadBan.
 	OverloadBanMinutes int
-	// OverloadTimeoutSeconds bounds how long attempt waits for the FIRST
-	// streamed event before treating the key as overloaded. <= 0 uses
-	// defaultOverloadTimeout.
+	// OverloadTimeoutSeconds bounds two separate things attempt checks
+	// against the same budget: how long it waits for the FIRST streamed
+	// event before treating the key as overloaded, and — post-hoc, once the
+	// call has already finished — how long the whole call was allowed to
+	// take before the key gets banned for future calls anyway (see
+	// keyrotation.BanIfSlow). <= 0 uses defaultOverloadTimeout.
 	OverloadTimeoutSeconds int
 }
 
@@ -319,6 +323,7 @@ var errFirstResponseTimeout = errors.New("anthropic: no response within first-re
 // since the forwarded-then-error rule above already forbids retrying past
 // that point anyway).
 func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.MessageNewParams, out chan<- llm.StreamChunk) error {
+	start := time.Now()
 	attemptCtx, cancelAttempt := context.WithCancel(ctx)
 	defer cancelAttempt()
 
@@ -397,6 +402,9 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.M
 		}
 	}
 
+	if elapsed := time.Since(start); keyrotation.BanIfSlow(p.bans, keyIndex, elapsed, p.rotation.overloadTimeout(), p.rotation.overloadBan()) {
+		p.logger.Warn("anthropic: request succeeded but took longer than the overload timeout end-to-end, banning key for future calls", "provider", p.name, "key_index", keyIndex, "duration", elapsed, "timeout", p.rotation.overloadTimeout(), "ban", p.rotation.overloadBan())
+	}
 	p.trace(ctx, params, &message, nil)
 	out <- llm.StreamChunk{Done: true}
 	return nil

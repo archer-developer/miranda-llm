@@ -145,6 +145,22 @@ func TestBanlist_ZeroOrNegativeDurationDoesNotBan(t *testing.T) {
 	require.False(t, b.Banned(0))
 }
 
+func TestBanIfSlow_ElapsedOverThresholdBans(t *testing.T) {
+	b := NewBanlist()
+	banned := BanIfSlow(b, 0, 16*time.Second, 10*time.Second, 30*time.Minute)
+	require.True(t, banned)
+	require.True(t, b.Banned(0))
+}
+
+func TestBanIfSlow_ElapsedAtOrUnderThresholdDoesNotBan(t *testing.T) {
+	b := NewBanlist()
+	require.False(t, BanIfSlow(b, 0, 10*time.Second, 10*time.Second, 30*time.Minute), "exactly at the threshold must not ban")
+	require.False(t, b.Banned(0))
+
+	require.False(t, BanIfSlow(b, 0, 5*time.Second, 10*time.Second, 30*time.Minute))
+	require.False(t, b.Banned(0))
+}
+
 func TestRun_SkipsBannedKeyAndTriesTheOther(t *testing.T) {
 	bans := NewBanlist()
 	bans.Ban(0, time.Hour)
