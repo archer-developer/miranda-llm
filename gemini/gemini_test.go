@@ -633,6 +633,54 @@ func TestGemini_SlowButSuccessfulCallBansKeyAfterwards(t *testing.T) {
 	require.True(t, p.bans.Banned(0), "a key that took longer than the overload timeout end-to-end must be banned even though it succeeded")
 }
 
+// TestGemini_MaxCallTimeoutAbandonsAndRotatesEvenAfterForwarding covers the
+// hard ceiling on total call time: key 0 forwards a first chunk promptly
+// (so the first-response watchdog never fires) but then the connection
+// hangs well past MaxCallSeconds. attempt must abandon it — even though
+// content was already forwarded — ban it, and rotate to key 1, whose full
+// answer arrives after the already-forwarded fragment. Both fragments must
+// reach the caller (the already-forwarded one is never "unsent"); this is
+// the explicitly-accepted duplication risk from keyrotation.BanIfSlow's
+// sibling mechanism, errMaxCallTimeout.
+func TestGemini_MaxCallTimeoutAbandonsAndRotatesEvenAfterForwarding(t *testing.T) {
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if idx == 0 {
+			_, _ = w.Write([]byte(textEvent(t, "partial from key 1")))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done() // hang past MaxCallSeconds without ever finishing the stream
+			return
+		}
+		_, _ = w.Write([]byte(textEvent(t, "full answer from key 2")))
+	}))
+	defer ts.Close()
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("GEMINI_MAXCALL_TEST_KEY_A", "fake-key-a")
+	t.Setenv("GEMINI_MAXCALL_TEST_KEY_B", "fake-key-b")
+	p, err := New(context.Background(), "gemini-test", "gemini-test-model",
+		[]string{"GEMINI_MAXCALL_TEST_KEY_A", "GEMINI_MAXCALL_TEST_KEY_B"},
+		ToolsConfig{}, RotationConfig{MaxCallSeconds: 1}, nil)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	got := collect(t, ch)
+
+	require.Contains(t, got.Text, "partial from key 1", "content already forwarded before the abandon must not be un-sent")
+	require.Contains(t, got.Text, "full answer from key 2")
+	require.Equal(t, 2, requestCount)
+	require.True(t, p.bans.Banned(0), "a key that blew the max-call budget must be banned even though it had already forwarded content")
+}
+
 // TestGemini_RotationEmitsNoChunksFromFailedAttempt confirms rotation still
 // forwards nothing from a key that fails before any content streams (the
 // common case — an HTTP-level error on connect, before Gemini has sent a

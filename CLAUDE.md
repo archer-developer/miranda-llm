@@ -37,9 +37,21 @@ mapping its own YAML config into them.
   fallback-only, no escalation — see "Structured output" below for why
   these two differ). `EscalationConfig` lives here — it's this package's
   own concept.
-- **`keyrotation`** — the generic "try N keys, cool down, retry" loop. Used
-  by `gemini` (multiple free-tier API keys); `anthropic` and `openaicompat`
-  don't rotate keys (single credential per client).
+- **`keyrotation`** — the generic "try N keys, cool down, retry" loop, plus
+  `Banlist` (cross-request ban state) and two independent guards against a
+  key that's overloaded rather than outright erroring: `FirstStepTimeout`
+  (abort/retry before anything forwards, if the backend never sends a first
+  byte) and `BanIfSlow` (post-hoc — ban a key whose call *did* complete but
+  took too long end-to-end). All three providers (`gemini`, `anthropic`,
+  `openaicompat`) rotate across `api_key_envs` and share this package;
+  `anthropic`/`openaicompat` just only ever use their first configured key
+  for `Structured` (that call has no streaming granularity to time-box the
+  same way). Each provider's own `RotationConfig.MaxCallSeconds` is a third,
+  harder guard `attempt()` applies directly (not through `Banlist`/`Run`):
+  a hard ceiling on total attempt duration that cancels and rotates even
+  after content has been forwarded — see each provider's `errMaxCallTimeout`
+  doc comment for why that's an accepted exception to the
+  forwarded-then-error rule the other two guards must obey.
 - **`llmtrace`** — writes one framed block per provider call to an
   `io.Writer` (typically a log file the consuming service opens). A `nil
   *Logger` is a valid no-op, so tracing is fully optional. `ContextTracer`

@@ -460,6 +460,56 @@ func TestOpenAICompat_SlowButSuccessfulCallBansKeyAfterwards(t *testing.T) {
 	require.True(t, p.bans.Banned(0), "a key that took longer than the overload timeout end-to-end must be banned even though it succeeded")
 }
 
+// TestOpenAICompat_MaxCallTimeoutAbandonsAndRotatesEvenAfterForwarding
+// mirrors gemini's/anthropic's own: key 0 forwards a first chunk promptly
+// (so the first-response watchdog never fires) but then the connection
+// hangs well past MaxCallSeconds. attempt must abandon it — even though
+// content was already forwarded — ban it, and rotate to key 1. Both
+// fragments must reach the caller; this is the explicitly-accepted
+// duplication risk from errMaxCallTimeout.
+func TestOpenAICompat_MaxCallTimeoutAbandonsAndRotatesEvenAfterForwarding(t *testing.T) {
+	full := openaiSuccessBody(t, "partial from key 1")
+	// openaiSuccessBody's first chunk carries an empty content delta (just
+	// role:"assistant"); the actual text is the SECOND chunk, so both must
+	// go out before hanging or nothing gets marked forwarded.
+	parts := strings.SplitN(full, "\n\n", 3)
+	require.Len(t, parts, 3, "test fixture must contain at least three SSE chunks to split on")
+	first := parts[0] + "\n\n" + parts[1] + "\n\n"
+
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if idx == 0 {
+			_, _ = w.Write([]byte(first))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done() // hang past MaxCallSeconds without ever finishing the stream
+			return
+		}
+		_, _ = w.Write([]byte(openaiSuccessBody(t, "full answer from key 2")))
+	}))
+	defer ts.Close()
+
+	t.Setenv("OPENAI_MAXCALL_TEST_KEY_0", "fake-key-0")
+	t.Setenv("OPENAI_MAXCALL_TEST_KEY_1", "fake-key-1")
+	p := New("openaicompat-test", ts.URL, "test-model",
+		[]string{"OPENAI_MAXCALL_TEST_KEY_0", "OPENAI_MAXCALL_TEST_KEY_1"},
+		RotationConfig{MaxCallSeconds: 1}, nil)
+
+	ch, err := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, err)
+	got := collect(t, ch)
+
+	require.Contains(t, got.Text, "partial from key 1", "content already forwarded before the abandon must not be un-sent")
+	require.Contains(t, got.Text, "full answer from key 2")
+	require.Equal(t, 2, requestCount)
+	require.True(t, p.bans.Banned(0), "a key that blew the max-call budget must be banned even though it had already forwarded content")
+}
+
 func TestOpenAICompat_StructuredRotatesOnQuotaError(t *testing.T) {
 	script := []scriptedResponse{
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},

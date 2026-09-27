@@ -643,6 +643,57 @@ func TestAnthropic_SlowButSuccessfulCallBansKeyAfterwards(t *testing.T) {
 	require.True(t, p.bans.Banned(0), "a key that took longer than the overload timeout end-to-end must be banned even though it succeeded")
 }
 
+// TestAnthropic_MaxCallTimeoutAbandonsAndRotatesEvenAfterForwarding mirrors
+// gemini's own: key 0 forwards a first content_block_delta promptly (so the
+// first-response watchdog never fires) but then the connection hangs well
+// past MaxCallSeconds. attempt must abandon it — even though content was
+// already forwarded — ban it, and rotate to key 1. Both fragments must
+// reach the caller; this is the explicitly-accepted duplication risk from
+// errMaxCallTimeout.
+func TestAnthropic_MaxCallTimeoutAbandonsAndRotatesEvenAfterForwarding(t *testing.T) {
+	full := anthropicSuccessBody(t, "partial from key 1")
+	splitAt := strings.Index(full, "event: content_block_stop")
+	require.Greater(t, splitAt, 0, "test fixture must contain a content_block_stop event to split on")
+	first := full[:splitAt]
+
+	requestCount := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := requestCount
+		requestCount++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if idx == 0 {
+			_, _ = w.Write([]byte(first))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done() // hang past MaxCallSeconds without ever finishing the stream
+			return
+		}
+		_, _ = w.Write([]byte(anthropicSuccessBody(t, "full answer from key 2")))
+	}))
+	defer ts.Close()
+	original := apiBaseURL
+	apiBaseURL = ts.URL
+	defer func() { apiBaseURL = original }()
+
+	t.Setenv("ANTHROPIC_MAXCALL_TEST_KEY_0", "fake-key-0")
+	t.Setenv("ANTHROPIC_MAXCALL_TEST_KEY_1", "fake-key-1")
+	p, err := New("anthropic-test", "claude-test-model",
+		[]string{"ANTHROPIC_MAXCALL_TEST_KEY_0", "ANTHROPIC_MAXCALL_TEST_KEY_1"},
+		ToolsConfig{}, RotationConfig{MaxCallSeconds: 1}, nil)
+	require.NoError(t, err)
+
+	ch, chatErr := p.Chat(context.Background(), llm.ChatRequest{Messages: []llm.Message{{Role: llm.RoleUser, Content: "hi"}}})
+	require.NoError(t, chatErr)
+	got := collect(t, ch)
+
+	require.Contains(t, got.Text, "partial from key 1", "content already forwarded before the abandon must not be un-sent")
+	require.Contains(t, got.Text, "full answer from key 2")
+	require.Equal(t, 2, requestCount)
+	require.True(t, p.bans.Banned(0), "a key that blew the max-call budget must be banned even though it had already forwarded content")
+}
+
 func TestAnthropic_StructuredRotatesOnQuotaError(t *testing.T) {
 	script := []scriptedResponse{
 		{statusCode: http.StatusTooManyRequests, errBody: quotaErrorBody},

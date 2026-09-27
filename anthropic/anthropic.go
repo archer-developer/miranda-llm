@@ -98,6 +98,15 @@ type RotationConfig struct {
 	// take before the key gets banned for future calls anyway (see
 	// keyrotation.BanIfSlow). <= 0 uses defaultOverloadTimeout.
 	OverloadTimeoutSeconds int
+	// MaxCallSeconds is a hard ceiling on one attempt's total wall-clock
+	// time, from the moment it starts to the moment its stream finishes —
+	// unlike OverloadTimeoutSeconds's post-hoc check, this one actively
+	// cancels the in-flight call once the budget is blown, even if content
+	// has already been forwarded to the caller (see attempt's doc comment:
+	// a stalled free-tier key can otherwise leave a user waiting nearly two
+	// minutes for a simple question, observed live 2026-09-27). <= 0 uses
+	// defaultMaxCallTimeout.
+	MaxCallSeconds int
 }
 
 // Built-in ban/timeout defaults applied whenever the corresponding
@@ -107,6 +116,7 @@ const (
 	defaultQuotaBan        = 30 * time.Minute
 	defaultOverloadBan     = 30 * time.Minute
 	defaultOverloadTimeout = 10 * time.Second
+	defaultMaxCallTimeout  = 30 * time.Second
 )
 
 func (r RotationConfig) quotaBan() time.Duration {
@@ -128,6 +138,13 @@ func (r RotationConfig) overloadTimeout() time.Duration {
 		return defaultOverloadTimeout
 	}
 	return time.Duration(r.OverloadTimeoutSeconds) * time.Second
+}
+
+func (r RotationConfig) maxCallTimeout() time.Duration {
+	if r.MaxCallSeconds <= 0 {
+		return defaultMaxCallTimeout
+	}
+	return time.Duration(r.MaxCallSeconds) * time.Second
 }
 
 // Provider is an llm.Provider (and llm.StructuredProvider) backed by the
@@ -289,6 +306,14 @@ var errAttemptWritten = errors.New("anthropic: attempt already wrote its termina
 // same name/reasoning.
 var errFirstResponseTimeout = errors.New("anthropic: no response within first-response timeout")
 
+// errMaxCallTimeout means attempt's own attemptCtx deadline
+// (RotationConfig.MaxCallSeconds) fired before the stream finished — mirrors
+// gemini's sentinel of the same name/reasoning, including the deliberate
+// exception to the forwarded-then-error rule below (isRetryable/banDuration
+// treat it as retryable and bannable unconditionally, even with partial
+// output already forwarded).
+var errMaxCallTimeout = errors.New("anthropic: attempt exceeded max call duration")
+
 // attempt makes exactly one Messages.NewStreaming call against one client
 // (one API key), forwarding TextDelta chunks to out live as they stream in
 // and using the SDK's built-in Message.Accumulate to reconstruct the full
@@ -305,7 +330,8 @@ var errFirstResponseTimeout = errors.New("anthropic: no response within first-re
 // otherwise say yes — rotating to another key re-runs the whole request
 // from scratch, and a caller that live-forwards chunks as they arrive has
 // no way to "unsay" one — mirrors gemini.Provider.attempt's own
-// forwarded-then-error rule.
+// forwarded-then-error rule. errMaxCallTimeout is the deliberate exception
+// (see its own doc comment).
 //
 // Returns nil once the response completes cleanly (having already written
 // Done to out). Returns errAttemptWritten in the two cases described above
@@ -324,7 +350,7 @@ var errFirstResponseTimeout = errors.New("anthropic: no response within first-re
 // that point anyway).
 func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.MessageNewParams, out chan<- llm.StreamChunk) error {
 	start := time.Now()
-	attemptCtx, cancelAttempt := context.WithCancel(ctx)
+	attemptCtx, cancelAttempt := context.WithTimeout(ctx, p.rotation.maxCallTimeout())
 	defer cancelAttempt()
 
 	// NewStreaming performs the actual HTTP request eagerly (before this
@@ -378,6 +404,14 @@ func (p *Provider) attempt(ctx context.Context, keyIndex int, params anthropic.M
 		}
 	}
 	if streamErr := stream.Err(); streamErr != nil {
+		// attemptCtx's own deadline (RotationConfig.MaxCallSeconds), not the
+		// caller's outer ctx — checked first, ahead of the
+		// forwarded-then-error rule below, since errMaxCallTimeout is the
+		// deliberate exception to it (see attempt's doc comment).
+		if errors.Is(streamErr, context.DeadlineExceeded) && ctx.Err() == nil {
+			p.logger.Warn("anthropic: attempt exceeded max call duration, abandoning and rotating to next key even though content may already be forwarded", "provider", p.name, "key_index", keyIndex, "elapsed", time.Since(start), "max_call_timeout", p.rotation.maxCallTimeout(), "forwarded", forwarded)
+			return errMaxCallTimeout
+		}
 		if forwarded {
 			p.logger.Error("anthropic: request failed mid-stream after partial output, not retrying", "provider", p.name, "key_index", keyIndex, "error", streamErr)
 			wrapped := fmt.Errorf("anthropic: stream: %w", streamErr)
@@ -479,7 +513,7 @@ func (p *Provider) logKeyRotate(keyIndex int, err error) {
 // gemini.isRetryable's doc comment for the production incident
 // (2026-08-27) this reasoning is shared with.
 func isRetryable(err error) bool {
-	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+	if errors.Is(err, errFirstResponseTimeout) || errors.Is(err, errMaxCallTimeout) || isOverloaded(err) {
 		return true
 	}
 	var apiErr *anthropic.Error
@@ -498,7 +532,7 @@ func isRetryable(err error) bool {
 // auth failure is retryable but isn't a transient condition a timed ban
 // would help with).
 func banDuration(err error, quotaBan, overloadBan time.Duration) time.Duration {
-	if errors.Is(err, errFirstResponseTimeout) || isOverloaded(err) {
+	if errors.Is(err, errFirstResponseTimeout) || errors.Is(err, errMaxCallTimeout) || isOverloaded(err) {
 		return overloadBan
 	}
 	var apiErr *anthropic.Error
