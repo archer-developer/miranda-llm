@@ -447,6 +447,14 @@ func encodeUserMessage(msg UserMessage) ([]byte, error) {
 	return append(line, '\n'), nil
 }
 
+// SupportedAttachment reports whether an attachment of mimeType can be sent
+// (see attachmentBlock) — for a caller that would rather drop an
+// unsupported image with a note than fail the whole turn.
+func SupportedAttachment(mimeType string) bool {
+	_, err := attachmentBlock(Attachment{MIMEType: mimeType})
+	return err == nil
+}
+
 // attachmentBlock maps an attachment to its Messages API content block —
 // "image" for the image types the API accepts, "document" for a PDF.
 // Anything else (e.g. image/heic, which phones produce and Gemini accepts) is

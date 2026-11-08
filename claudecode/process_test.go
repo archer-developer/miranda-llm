@@ -290,3 +290,11 @@ func TestResolveBinaryIsAbsolute(t *testing.T) {
 		t.Fatal("a missing binary must be an error")
 	}
 }
+
+func TestSupportedAttachment(t *testing.T) {
+	for mime, want := range map[string]bool{"image/jpeg": true, "image/webp": true, "application/pdf": true, "image/heic": false, "text/plain": false} {
+		if got := SupportedAttachment(mime); got != want {
+			t.Errorf("SupportedAttachment(%q) = %v, want %v", mime, got, want)
+		}
+	}
+}
