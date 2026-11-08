@@ -81,6 +81,21 @@ mapping its own YAML config into them.
 - **`gemini`, `anthropic`, `openaicompat`** — one `Provider` implementation
   each. `gemini.ToolsConfig`/`gemini.RotationConfig` and
   `anthropic.ToolsConfig` are this package's own config types.
+- **`claudecode`** — the headless Claude Code CLI (`claude -p`, stream-json
+  in/out) as a backend, spending a claude.ai subscription login instead of
+  API keys. Three pieces: `Process` (one CLI process + its wire protocol —
+  ported from miranda's `internal/claudecode`, where the isolation flag set
+  was proven against the real CLI; adds PDF/image attachments and
+  `--json-schema`), `Provider` (`llm.Provider` + `llm.StructuredProvider` for
+  one-shot calls: every `Chat`/`Structured` starts a fresh process and closes
+  it once it has answered — no tool calling (`ErrToolsUnsupported`), no
+  temperature, no streaming), and `TraceBuilder` (renders a multi-step,
+  tool-calling `Turn` into Anthropic-shaped `llmtrace` blocks, one per model
+  call, split by assistant message id). A caller that wants Claude Code to
+  drive its own tools exposes them over a loopback MCP server and drives a
+  `Process` itself — see miranda-medical-card's
+  `docs/adr/010-claude-code-engine.md` and `internal/ask/claude_code_engine.go`.
+  Tests run the package's own test binary as a fake CLI (`TestMain`).
 - **`embedding`** — `Embedder` interface + `GeminiEmbedder`. Deliberately
   independent of the root `llm` package's chat types — an embedding call is
   a different shape (one text in, one vector out) with no conversation or
@@ -92,8 +107,8 @@ mapping its own YAML config into them.
 
 ## Structured output
 
-`llm.StructuredProvider` (optional — implemented by all three provider
-packages here) and `router.Router.Structured` give single-shot,
+`llm.StructuredProvider` (optional — implemented by every provider package
+here) and `router.Router.Structured` give single-shot,
 schema-constrained JSON output, for services that need Extraction/Planner/
 Summary-style calls rather than open-ended chat.
 
@@ -107,6 +122,9 @@ offers:
   supports this; not every OpenAI-*compatible* backend does — an
   unsupported backend just returns its own error, wrapped and returned,
   with no local fallback).
+- **`claudecode`**: the CLI's own `--json-schema` — it makes the model
+  answer through a validated `StructuredOutput` tool call and returns the
+  value as the result event's `structured_output`.
 - **`anthropic`**: the Messages API has no native equivalent, so this
   forces the model to call a single synthetic tool whose input schema *is*
   `req.Schema`, via `ToolChoice`, then reads the tool call's `Input` back —

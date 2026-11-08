@@ -56,8 +56,24 @@ type geminiUsage struct {
 // from JSON. ---
 
 func anthropicBlockText(block map[string]any, key string) (string, bool) {
-	v, ok := block[key].(string)
-	return v, ok
+	switch v := block[key].(type) {
+	case string:
+		return v, true
+	case []any:
+		// A tool_result's content may also be an array of content blocks
+		// ([{"type":"text","text":...}]) — the shape the Claude Code CLI
+		// reports MCP tool results in (miranda-llm/claudecode traces).
+		var parts []string
+		for _, item := range v {
+			if inner, ok := item.(map[string]any); ok {
+				if text, ok := inner["text"].(string); ok {
+					parts = append(parts, text)
+				}
+			}
+		}
+		return strings.Join(parts, "\n"), len(parts) > 0
+	}
+	return "", false
 }
 
 // --- shared decoding ---

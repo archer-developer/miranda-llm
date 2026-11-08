@@ -23,6 +23,8 @@ github.com/archer-developer/miranda-llm/llmtrace      — request/response trace
 github.com/archer-developer/miranda-llm/gemini        — llm.Provider for native Gemini
 github.com/archer-developer/miranda-llm/anthropic     — llm.Provider for native Claude
 github.com/archer-developer/miranda-llm/openaicompat  — llm.Provider for any OpenAI-compatible endpoint
+github.com/archer-developer/miranda-llm/claudecode    — headless Claude Code CLI: one-shot llm.Provider
+                                                         (fresh process per call) + Process/TraceBuilder
 github.com/archer-developer/miranda-llm/embedding     — Embedder interface + Gemini implementation
 github.com/archer-developer/miranda-llm/llmtest       — scriptable fakes for tests
 ```

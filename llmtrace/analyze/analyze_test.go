@@ -155,6 +155,27 @@ func TestParseAll_AnthropicShape(t *testing.T) {
 	require.False(t, EndsOnToolCallWithNoAnswer(blocks[1]))
 }
 
+// TestDescribeIncoming_AnthropicToolResultBlockArray covers a tool_result
+// whose content is an array of content blocks — how the Claude Code CLI
+// reports MCP tool results (miranda-llm/claudecode traces) — including the
+// "error: ..." convention the anomaly detector looks for.
+func TestDescribeIncoming_AnthropicToolResultBlockArray(t *testing.T) {
+	log := `=== 2026-11-08T19:32:12Z provider=claude_code ===
+--- request ---
+{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"lab_results","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"error: unknown tool"}]}]}]}
+--- response ---
+{"content":[{"type":"text","text":"ok"}]}
+
+`
+	blocks, err := ParseAll(strings.NewReader(log))
+	require.NoError(t, err)
+	require.Len(t, blocks, 1)
+	require.False(t, IsFirstTurn(blocks[0]))
+	in, ok := DescribeIncoming(blocks[0], false)
+	require.True(t, ok)
+	require.Equal(t, []string{"tool result -> error: unknown tool"}, in)
+}
+
 func TestParseAll_ErrorBlock(t *testing.T) {
 	log := `=== 2026-08-12T18:30:00Z provider=gemini-agent conversation=session_3 ===
 --- request ---
